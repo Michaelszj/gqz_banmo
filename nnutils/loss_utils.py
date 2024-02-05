@@ -437,9 +437,9 @@ def compute_root_sm_loss(rtk_all, data_offset):
         rot_sm_loss.append(rot_sm_sub)
         trans_sm_loss.append(trans_sm_sub)
     rot_sm_loss = torch.cat(rot_sm_loss,0)
-    rot_sm_loss = rot_angle(rot_sm_loss).mean()*1e-3
+    rot_sm_loss = (rot_angle(rot_sm_loss)**2).mean()*1e-2
     trans_sm_loss = torch.cat(trans_sm_loss,0)
-    trans_sm_loss = trans_sm_loss.norm(2,-1).mean()*0.1
+    trans_sm_loss = (trans_sm_loss.norm(2,-1)**2).mean()
     root_sm_loss = rot_sm_loss + trans_sm_loss 
     return root_sm_loss
 

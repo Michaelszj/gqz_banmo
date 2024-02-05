@@ -5,10 +5,8 @@ from __future__ import division
 from __future__ import print_function
 from absl import app
 from absl import flags
-from collections import defaultdict
 import os
 import os.path as osp
-import pickle
 import sys
 sys.path.insert(0, 'third_party')
 import cv2, numpy as np, time, torch, torchvision
@@ -18,9 +16,10 @@ import torch.nn.functional as F
 import trimesh, pytorch3d, pytorch3d.loss, pdb
 from pytorch3d import transforms
 import configparser
-
+import argparse
+from arguments import ModelParams, PipelineParams, OptimizationParams
 from nnutils.nerf import Embedding, NeRF, RTHead, SE3head, RTExplicit, Encoder,\
-                    ScoreHead, Transhead, NeRFUnc, \
+                    ScoreHead, Transhead, NeRFUnc, MLP,\
                     grab_xyz_weights, FrameCode, RTExpMLP
 from nnutils.geom_utils import K2mat, mat2K, Kmatinv, K2inv, raycast, sample_xy,\
                                 chunk_rays, generate_bones,\
@@ -30,13 +29,19 @@ from nnutils.geom_utils import K2mat, mat2K, Kmatinv, K2inv, raycast, sample_xy,
                                 render_color, mask_aug, bbox_dp2rnd, resample_dp, \
                                 vrender_flo, get_near_far, array2tensor, rot_angle, \
                                 rtk_invert, rtk_compose, bone_transform, correct_bones,\
-                                correct_rest_pose, fid_reindex
+                                correct_rest_pose, fid_reindex, skinning, lbs
 from nnutils.rendering import render_rays
 from nnutils.loss_utils import eikonal_loss, rtk_loss, \
                             feat_match_loss, kp_reproj_loss, grad_update_bone, \
                             loss_filter, loss_filter_line, compute_xyz_wt_loss,\
-                            compute_root_sm_2nd_loss, shape_init_loss
-from utils.io import draw_pts
+                            compute_root_sm_2nd_loss, shape_init_loss, compute_root_sm_loss
+from tqdm import tqdm
+from utils.io import draw_pts,save_vid,draw_cams
+from utils.loss_utils import l1_loss, ssim
+from scene.gaussian_model import GaussianModel
+from scene.cameras import Camera
+from gaussian_renderer import render_auto,render
+import torch.nn.functional as F
 
 # distributed data parallel
 flags.DEFINE_integer('local_rank', 0, 'for distributed training')
@@ -53,6 +58,7 @@ flags.DEFINE_string('rtk_path', '', 'path to rtk files')
 flags.DEFINE_bool('lineload',False,'whether to use pre-computed data per line')
 flags.DEFINE_integer('n_data_workers', 1, 'Number of data loading workers')
 flags.DEFINE_boolean('use_rtk_file', False, 'whether to use input rtk files')
+flags.DEFINE_boolean('preload_pose', False, 'whether to use pre_estimated rtk files')
 flags.DEFINE_boolean('debug', False, 'deubg')
 
 # model: shape, appearance, and feature
@@ -107,7 +113,7 @@ flags.DEFINE_bool('init_ellips', False, 'whether to init shape as ellips')
 flags.DEFINE_integer('warmup_pose_ep', 0, 'epochs to pre-train cnn pose predictor')
 flags.DEFINE_integer('warmup_shape_ep', 0, 'epochs to pre-train nerf')
 flags.DEFINE_bool('warmup_rootmlp', False, 'whether to preset base root pose (compatible with expmlp root basis only)')
-flags.DEFINE_bool('unc_filter', True, 'whether to filter root poses init with low uncertainty')
+flags.DEFINE_bool('unc_filter', False, 'whether to filter root poses init with low uncertainty')
 
 # optimization: fine-tuning
 flags.DEFINE_bool('keep_pose_basis', True, 'keep pose basis when loading models at train time')
@@ -142,8 +148,8 @@ flags.DEFINE_integer('sample_grid3d', 64, 'resolution for mesh extraction from n
 flags.DEFINE_string('test_frames', '9', 'a list of video index or num of frames, {0,1,2}, 30')
 
 # losses
-flags.DEFINE_bool('use_embed', True, 'whether to use feature consistency losses')
-flags.DEFINE_bool('use_proj', True, 'whether to use reprojection loss')
+flags.DEFINE_bool('use_embed', False, 'whether to use feature consistency losses')
+flags.DEFINE_bool('use_proj', False, 'whether to use reprojection loss')
 flags.DEFINE_bool('use_corresp', True, 'whether to render and compare correspondence')
 flags.DEFINE_bool('dist_corresp', True, 'whether to render distributed corresp')
 flags.DEFINE_float('total_wt', 1, 'by default, multiple total loss by 1')
@@ -155,7 +161,7 @@ flags.DEFINE_float('proj_wt', 0.02, 'by default, multiple proj loss by 1')
 flags.DEFINE_float('flow_wt', 1, 'by default, multiple flow loss by 1')
 flags.DEFINE_float('cyc_wt', 1, 'by default, multiple cyc loss by 1')
 flags.DEFINE_bool('rig_loss', False,'whether to use globally rigid loss')
-flags.DEFINE_bool('root_sm', True, 'whether to use smooth loss for root pose')
+flags.DEFINE_bool('root_sm', False, 'whether to use smooth loss for root pose')
 flags.DEFINE_float('eikonal_wt', 0., 'weight of eikonal loss')
 flags.DEFINE_float('bone_loc_reg', 0.1, 'use bone location regularization')
 flags.DEFINE_bool('loss_flt', True, 'whether to use loss filter')
@@ -188,6 +194,7 @@ class banmo(nn.Module):
         self.img_size = opts.img_size # current rendering size, 
                                       # have to be consistent with dataloader, 
                                       # eval/train has different size
+        self.num_epochs = opts.num_epochs
         embed_net = nn.Embedding
         
         # multi-video mode
@@ -204,40 +211,35 @@ class banmo(nn.Module):
         # rtk raw scaled and refined
         self.latest_vars['rtk'] = np.zeros((self.data_offset[-1], 4,4))
         self.latest_vars['idk'] = np.zeros((self.data_offset[-1],))
+        self.latest_vars['kaug'] = np.zeros((self.data_offset[-1],4))
         self.latest_vars['mesh_rest'] = trimesh.Trimesh()
-        if opts.lineload:
-            #TODO todo, this should be idx512,-1
-            self.latest_vars['fp_err'] =       np.zeros((self.data_offset[-1]*opts.img_size,2)) # feat, proj
-            self.latest_vars['flo_err'] =      np.zeros((self.data_offset[-1]*opts.img_size,6)) 
-            self.latest_vars['sil_err'] =      np.zeros((self.data_offset[-1]*opts.img_size,)) 
-            self.latest_vars['flo_err_hist'] = np.zeros((self.data_offset[-1]*opts.img_size,6,10))
-        else:
-            self.latest_vars['fp_err'] =       np.zeros((self.data_offset[-1],2)) # feat, proj
-            self.latest_vars['flo_err'] =      np.zeros((self.data_offset[-1],6)) 
-            self.latest_vars['sil_err'] =      np.zeros((self.data_offset[-1],)) 
-            self.latest_vars['flo_err_hist'] = np.zeros((self.data_offset[-1],6,10))
-
-        # get near-far plane
-        self.near_far = np.zeros((self.data_offset[-1],2))
-        self.near_far[...,1] = 6.
-        self.near_far = self.near_far.astype(np.float32)
-        self.near_far = torch.Tensor(self.near_far).to(self.device)
-        self.obj_scale = float(near_far_to_bound(self.near_far)) / 0.3 # to 0.3
-        self.near_far = self.near_far / self.obj_scale
-        self.near_far_base = self.near_far.clone() # used for create_base_se3()
-        self.near_far = nn.Parameter(self.near_far)
-    
-        # object bound
-        self.latest_vars['obj_bound'] = np.asarray([1.,1.,1.])
-        self.latest_vars['obj_bound'] *= near_far_to_bound(self.near_far)
-
-        self.vis_min=np.asarray([[0,0,0]])
-        self.vis_len=self.latest_vars['obj_bound']/2
         
+        self.latest_vars['fp_err'] =       np.zeros((self.data_offset[-1],2)) # feat, proj
+        self.latest_vars['flo_err'] =      np.zeros((self.data_offset[-1],6)) 
+        self.latest_vars['sil_err'] =      np.zeros((self.data_offset[-1],)) 
+        self.latest_vars['flo_err_hist'] = np.zeros((self.data_offset[-1],6,10))
+
+        
+        self.bound = .2
+        self.obj_scale = 10.
         # set shape/appearancce model
         self.num_freqs = 10
         in_channels_xyz=3+3*self.num_freqs*2
         in_channels_dir=27
+        self.gs_code_dim=9
+        
+            
+        self.gaussians = GaussianModel(1,self.bound,code_dim=self.gs_code_dim)
+        parser = argparse.ArgumentParser()
+        op = OptimizationParams(parser)
+        op.iterations = self.num_epochs*self.num_fr
+        op.densify_until_iter = self.num_epochs*self.num_fr//2
+        self.gaussians.random_init()
+        self.gaussians.training_setup(op)
+        self.optim = op
+        self.networks= {}
+
+        # env embedding
         if opts.env_code:
             # add video-speficit environment lighting embedding
             env_code_dim = 64
@@ -247,70 +249,48 @@ class banmo(nn.Module):
                 self.env_code = embed_net(self.num_fr, env_code_dim)
         else:
             env_code_dim = 0
-        self.nerf_coarse = NeRF(in_channels_xyz=in_channels_xyz, 
-                                in_channels_dir=in_channels_dir+env_code_dim,
-                                init_beta=opts.init_beta)
-        self.embedding_xyz = Embedding(3,self.num_freqs,alpha=self.alpha.data[0])
-        self.embedding_dir = Embedding(3,4,             alpha=self.alpha.data[0])
-        self.embeddings = {'xyz':self.embedding_xyz, 'dir':self.embedding_dir}
-        self.nerf_models= {'coarse':self.nerf_coarse}
-
-        # set motion model
+            
+        # pose embedding
         t_embed_dim = opts.t_embed_dim
         if opts.frame_code:
             self.pose_code = FrameCode(self.num_freqs, t_embed_dim, self.data_offset)
         else:
             self.pose_code = embed_net(self.num_fr, t_embed_dim)
-        if opts.flowbw:
-            if opts.se3_flow:
-                flow3d_arch = SE3head
-                out_channels=9
-            else:
-                flow3d_arch = Transhead
-                out_channels=3
-            self.nerf_flowbw = flow3d_arch(in_channels_xyz=in_channels_xyz+t_embed_dim,
-                                D=5, W=128,
-                    out_channels=out_channels,in_channels_dir=0, raw_feat=True)
-            self.nerf_flowfw = flow3d_arch(in_channels_xyz=in_channels_xyz+t_embed_dim,
-                                D=5, W=128,
-                    out_channels=out_channels,in_channels_dir=0, raw_feat=True)
-            self.nerf_models['flowbw'] = self.nerf_flowbw
-            self.nerf_models['flowfw'] = self.nerf_flowfw
-                
-        elif opts.lbs:
+        
+        # bone transform
+        if opts.lbs:
             self.num_bones = opts.num_bones
             bones= generate_bones(self.num_bones, self.num_bones, 0, self.device)
             self.bones = nn.Parameter(bones)
-            self.nerf_models['bones'] = self.bones
             self.num_bone_used = self.num_bones # bones used in the model
-
             self.nerf_body_rts = nn.Sequential(self.pose_code,
                                 RTHead(use_quat=False, 
                                 #D=5,W=128,
                                 in_channels_xyz=t_embed_dim,in_channels_dir=0,
                                 out_channels=6*self.num_bones, raw_feat=True))
-            #TODO scale+constant parameters
+            self.networks['bones'] = self.bones
+            self.networks['nerf_body_rts'] = self.nerf_body_rts
+            
+        # skinning weights
+        if opts.nerf_skin:
+            self.nerf_skin =  MLP(code_dim=self.gs_code_dim,pose_dim=t_embed_dim,output_dim=self.num_bones)
+            self.nerf_skin = NeRF(in_channels_xyz=in_channels_xyz+t_embed_dim,
+#                                    D=5,W=128,
+                                D=4,W=64,
+                    in_channels_dir=0, out_channels=self.num_bones, 
+                    raw_feat=True, in_channels_code=t_embed_dim)
+            self.rest_pose_code = embed_net(1, t_embed_dim)
+            self.networks['nerf_skin'] = self.nerf_skin
+            self.networks['rest_pose_code'] = self.rest_pose_code
             skin_aux = torch.Tensor([0,self.obj_scale]) 
             self.skin_aux = nn.Parameter(skin_aux)
-            self.nerf_models['skin_aux'] = self.skin_aux
+            self.networks['skin_aux'] = self.skin_aux
 
-            if opts.nerf_skin:
-                self.nerf_skin = NeRF(in_channels_xyz=in_channels_xyz+t_embed_dim,
-#                                    D=5,W=128,
-                                    D=5,W=64,
-                     in_channels_dir=0, out_channels=self.num_bones, 
-                     raw_feat=True, in_channels_code=t_embed_dim)
-                self.rest_pose_code = embed_net(1, t_embed_dim)
-                self.nerf_models['nerf_skin'] = self.nerf_skin
-                self.nerf_models['rest_pose_code'] = self.rest_pose_code
-
-        # set visibility nerf
-        if opts.nerf_vis:
-            self.nerf_vis = NeRF(in_channels_xyz=in_channels_xyz, D=5, W=64, 
-                                    out_channels=1, in_channels_dir=0,
-                                    raw_feat=True)
-            self.nerf_models['nerf_vis'] = self.nerf_vis
-        
+        # delta color, opacity...
+        if True:
+            self.delta_net = MLP(code_dim=self.gs_code_dim,pose_dim=12*self.num_bones+env_code_dim,output_dim=11)
+            self.networks['delta_net'] = self.delta_net
+            
         # optimize camera
         if opts.root_opt:
             if self.use_cam: 
@@ -348,6 +328,7 @@ class banmo(nn.Module):
                             out_channels=out_channels, raw_feat=True)
                 self.nerf_root_rts = nn.Sequential(self.root_code, output_head)
             else: print('error'); exit()
+            self.networks['nerf_root_rts'] = self.nerf_root_rts
 
         # intrinsics
         ks_list = []
@@ -360,355 +341,300 @@ class banmo(nn.Module):
             self.ks_param = nn.Parameter(self.ks_param)
             
 
-        # densepose
-        detbase='./third_party/detectron2/'
-        if opts.use_human:
-            canonical_mesh_name = 'smpl_27554'
-            config_path = '%s/projects/DensePose/configs/cse/densepose_rcnn_R_101_FPN_DL_soft_s1x.yaml'%(detbase)
-            weight_path = 'https://dl.fbaipublicfiles.com/densepose/cse/densepose_rcnn_R_101_FPN_DL_soft_s1x/250713061/model_final_1d3314.pkl'
-        else:
-            canonical_mesh_name = 'sheep_5004'
-            config_path = '%s/projects/DensePose/configs/cse/densepose_rcnn_R_50_FPN_soft_animals_CA_finetune_4k.yaml'%(detbase)
-            weight_path = 'https://dl.fbaipublicfiles.com/densepose/cse/densepose_rcnn_R_50_FPN_soft_animals_CA_finetune_4k/253498611/model_final_6d69b7.pkl'
-        canonical_mesh_path = 'mesh_material/%s_sph.pkl'%canonical_mesh_name
+    #     # densepose
+    #     detbase='./third_party/detectron2/'
+    #     if opts.use_human:
+    #         canonical_mesh_name = 'smpl_27554'
+    #         config_path = '%s/projects/DensePose/configs/cse/densepose_rcnn_R_101_FPN_DL_soft_s1x.yaml'%(detbase)
+    #         weight_path = 'https://dl.fbaipublicfiles.com/densepose/cse/densepose_rcnn_R_101_FPN_DL_soft_s1x/250713061/model_final_1d3314.pkl'
+    #     else:
+    #         canonical_mesh_name = 'sheep_5004'
+    #         config_path = '%s/projects/DensePose/configs/cse/densepose_rcnn_R_50_FPN_soft_animals_CA_finetune_4k.yaml'%(detbase)
+    #         weight_path = 'https://dl.fbaipublicfiles.com/densepose/cse/densepose_rcnn_R_50_FPN_soft_animals_CA_finetune_4k/253498611/model_final_6d69b7.pkl'
+    #     canonical_mesh_path = 'mesh_material/%s_sph.pkl'%canonical_mesh_name
         
-        with open(canonical_mesh_path, 'rb') as f:
-            dp = pickle.load(f)
-            self.dp_verts = dp['vertices']
-            self.dp_faces = dp['faces'].astype(int)
-            self.dp_verts = torch.Tensor(self.dp_verts).cuda(self.device)
-            self.dp_faces = torch.Tensor(self.dp_faces).cuda(self.device).long()
+    #     with open(canonical_mesh_path, 'rb') as f:
+    #         dp = pickle.load(f)
+    #         self.dp_verts = dp['vertices']
+    #         self.dp_faces = dp['faces'].astype(int)
+    #         self.dp_verts = torch.Tensor(self.dp_verts).cuda(self.device)
+    #         self.dp_faces = torch.Tensor(self.dp_faces).cuda(self.device).long()
             
-            self.dp_verts -= self.dp_verts.mean(0)[None]
-            self.dp_verts /= self.dp_verts.abs().max()
-            self.dp_verts_unit = self.dp_verts.clone()
-            self.dp_verts *= (self.near_far[:,1] - self.near_far[:,0]).mean()/2
+    #         self.dp_verts -= self.dp_verts.mean(0)[None]
+    #         self.dp_verts /= self.dp_verts.abs().max()
+    #         self.dp_verts_unit = self.dp_verts.clone()
+    #         self.dp_verts *= (self.near_far[:,1] - self.near_far[:,0]).mean()/2
             
-            # visualize
-            self.dp_vis = self.dp_verts.detach()
-            self.dp_vmin = self.dp_vis.min(0)[0][None]
-            self.dp_vis = self.dp_vis - self.dp_vmin
-            self.dp_vmax = self.dp_vis.max(0)[0][None]
-            self.dp_vis = self.dp_vis / self.dp_vmax
+    #         # visualize
+    #         self.dp_vis = self.dp_verts.detach()
+    #         self.dp_vmin = self.dp_vis.min(0)[0][None]
+    #         self.dp_vis = self.dp_vis - self.dp_vmin
+    #         self.dp_vmax = self.dp_vis.max(0)[0][None]
+    #         self.dp_vis = self.dp_vis / self.dp_vmax
 
-            # save colorvis
-            if not os.path.isdir('tmp'): os.mkdir('tmp')
-            trimesh.Trimesh(self.dp_verts_unit.cpu().numpy(), 
-                            dp['faces'], 
-                            vertex_colors = self.dp_vis.cpu().numpy())\
-                            .export('tmp/%s.obj'%canonical_mesh_name)
+    #         # save colorvis
+    #         if not os.path.isdir('tmp'): os.mkdir('tmp')
+    #         trimesh.Trimesh(self.dp_verts_unit.cpu().numpy(), 
+    #                         dp['faces'], 
+    #                         vertex_colors = self.dp_vis.cpu().numpy())\
+    #                         .export('tmp/%s.obj'%canonical_mesh_name)
             
-            if opts.unc_filter:
-                from utils.cselib import create_cse
-                # load surface embedding
-                _, _, mesh_vertex_embeddings = create_cse(config_path,
-                                                                weight_path)
-                self.dp_embed = mesh_vertex_embeddings[canonical_mesh_name]
+    #         if opts.unc_filter:
+    #             from utils.cselib import create_cse
+    #             # load surface embedding
+    #             _, _, mesh_vertex_embeddings = create_cse(config_path,
+    #                                                             weight_path)
+    #             self.dp_embed = mesh_vertex_embeddings[canonical_mesh_name]
 
-        # add densepose mlp
-        if opts.use_embed:
-            self.num_feat = 16
-            # TODO change this to D-8
-            self.nerf_feat = NeRF(in_channels_xyz=in_channels_xyz, D=5, W=128,
-     out_channels=self.num_feat,in_channels_dir=0, raw_feat=True, init_beta=1.)
-            self.nerf_models['nerf_feat'] = self.nerf_feat
+    #     # add densepose mlp
+    #     if opts.use_embed:
+    #         self.num_feat = 16
+    #         # TODO change this to D-8
+    #         self.nerf_feat = NeRF(in_channels_xyz=in_channels_xyz, D=5, W=128,
+    #  out_channels=self.num_feat,in_channels_dir=0, raw_feat=True, init_beta=1.)
+    #         self.networks['nerf_feat'] = self.nerf_feat
 
-            if opts.ft_cse:
-                from nnutils.cse import CSENet
-                self.csenet = CSENet(ishuman=opts.use_human)
+    #         if opts.ft_cse:
+    #             from nnutils.cse import CSENet
+    #             self.csenet = CSENet(ishuman=opts.use_human)
 
 
-        # add uncertainty MLP
-        if opts.use_unc:
-            # input, (x,y,t)+code, output, (1)
-            vid_code_dim=32  # add video-specific code
-            self.vid_code = embed_net(self.num_vid, vid_code_dim)
-            #self.nerf_unc = NeRFUnc(in_channels_xyz=in_channels_xyz, D=5, W=128,
-            self.nerf_unc = NeRFUnc(in_channels_xyz=in_channels_xyz, D=8, W=256,
-         out_channels=1,in_channels_dir=vid_code_dim, raw_feat=True, init_beta=1.)
-            self.nerf_models['nerf_unc'] = self.nerf_unc
+        # # add uncertainty MLP
+        # if opts.use_unc:
+        #     # input, (x,y,t)+code, output, (1)
+        #     vid_code_dim=32  # add video-specific code
+        #     self.vid_code = embed_net(self.num_vid, vid_code_dim)
+        #     #self.nerf_unc = NeRFUnc(in_channels_xyz=in_channels_xyz, D=5, W=128,
+        #     self.nerf_unc = NeRFUnc(in_channels_xyz=in_channels_xyz, D=8, W=256,
+        #  out_channels=1,in_channels_dir=vid_code_dim, raw_feat=True, init_beta=1.)
+        #     self.networks['nerf_unc'] = self.nerf_unc
 
-        if opts.warmup_pose_ep>0:
-            # soft renderer
-            import soft_renderer as sr
-            self.mesh_renderer = sr.SoftRenderer(image_size=256, sigma_val=1e-12, 
-                           camera_mode='look_at',perspective=False, aggr_func_rgb='hard',
-                           light_mode='vertex', light_intensity_ambient=1.,light_intensity_directionals=0.)
+        # if opts.warmup_pose_ep>0:
+        #     # soft renderer
+        #     import soft_renderer as sr
+        #     self.mesh_renderer = sr.SoftRenderer(image_size=256, sigma_val=1e-12, 
+        #                    camera_mode='look_at',perspective=False, aggr_func_rgb='hard',
+        #                    light_mode='vertex', light_intensity_ambient=1.,light_intensity_directionals=0.)
 
 
         self.resnet_transform = torchvision.transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225])
 
+    
+
+    def main_render(self,rtk,img_size,embedid,use_dskin=False,background=torch.tensor([0.,0.,0.]).cuda(),canonical=False):
+        # rtk: (4,4)
+        H,W = img_size
+        R = rtk[:3,:3]
+        T = rtk[:3,3:]
+        K = rtk[3]
+        FovX = 2. * torch.arctan(W / (2. * K[0]))
+        FovY = 2. * torch.arctan(H / (2. * K[1]))
+        cam = Camera(0, R, T, FovX, FovY,
+                 None, None, '', 0, width=W, height=H)
+        
+        if canonical:
+            output = render(cam,self.gaussians,background)
+            return output
+        
+        gaussian_xyz =self.gaussians._xyz
+        gaussian_code = self.gaussians._code
+        pose_code = self.pose_code(embedid)
+        env_code = self.env_code(embedid)
+        bones_rst = self.bones
+        bone_rts_fw = self.nerf_body_rts(embedid)
+        
+        skin = skinning(bones_rst, gaussian_xyz[None,...], skin_aux=self.skin_aux).squeeze()
+        if use_dskin:
+            dskin = self.nerf_skin(gaussian_code,pose_code)
+            skin = skin + dskin
+            
+        gaussian_xyz_dfm, bones_dfm = lbs(bones_rst[None,...], bone_rts_fw[None,...], skin[None,...], 
+                gaussian_xyz[None,...],backward=False)
+        gaussian_xyz_dfm = gaussian_xyz_dfm[0]
+        
+        deltas = self.delta_net(gaussian_code,torch.cat([bone_rts_fw[0],env_code],dim=-1))
+        
+        colors = self.gaussians._features_dc
+        f_rest = self.gaussians._features_rest
+        scales = self.gaussians._scaling
+        rotations = self.gaussians._rotation
+        opacities = self.gaussians._opacity
+        
+        d_color, d_scale, d_rotation, d_opacity = torch.split(deltas,[3,3,4,1],dim=-1)
+        colors_t = colors+d_color.unsqueeze(1)
+        # colors_t = torch.sigmoid(colors_t)
+        
+        scales_t = scales+d_scale
+        scales_t = torch.exp(scales_t)
+        
+        # d_rotation[:,0] += 1.
+        # import pdb;pdb.set_trace()
+        rotations_t = rotations+d_rotation
+        rotations_t = F.normalize(rotations_t,dim=-1)
+        
+        opacities_t = opacities+d_opacity
+        opacities_t = torch.sigmoid(opacities_t)
+        
+        
+        # import pdb;pdb.set_trace()
+        output = render_auto(cam,gaussian_xyz_dfm,scales_t,rotations_t,torch.cat([colors_t,f_rest],dim=-2),opacities_t,
+                             self.gaussians,background)
+        return output
+        
+        
+        
+        
     def forward_default(self, batch):
+        # import pdb;pdb.set_trace()
         opts = self.opts
         # get root poses
-        rtk_all = self.compute_rts()
-
-        # change near-far plane for all views
-        if self.progress>=opts.nf_reset:
-            rtk_np = rtk_all.clone().detach().cpu().numpy()
-            valid_rts = self.latest_vars['idk'].astype(bool)
-            self.latest_vars['rtk'][valid_rts,:3] = rtk_np[valid_rts]
-            self.near_far.data = get_near_far(
-                                          self.near_far.data,
-                                          self.latest_vars)
-
-        if opts.debug:
-            torch.cuda.synchronize()
-            start_time = time.time()
-        if opts.lineload:
-            bs = self.set_input(batch, load_line=True)
-        else:
-            bs = self.set_input(batch)
         
-        if opts.debug:
-            torch.cuda.synchronize()
-            print('set input time:%.2f'%(time.time()-start_time))
-        rtk = self.rtk
-        kaug= self.kaug
-        embedid=self.embedid
-        aux_out={}
+        
+        
+        rtk_all = self.compute_rts()
+        self.rtk_all = rtk_all
+        try:
+            rtk = self.compute_rts(batch['frameid'].to(self.device).long())[0]
+        except:
+            import pdb;pdb.set_trace()
+        # rtk = rtk_all[batch['frameid'].long()].squeeze()
+        rtk = torch.cat([rtk,self.ks_param[batch['dataid'].to(self.device).long()]],dim=0)
+        # kaug= self.kaug
+        embedid=batch['frameid'].to(self.device)+self.data_offset[batch['dataid'].long()]
+        H = batch['img'].shape[-2]
+        W = batch['img'].shape[-1]
+        # aux_out={}
         
         # Render
-        rendered, rand_inds = self.nerf_render(rtk, kaug, embedid, 
-                nsample=opts.nsample, ndepth=opts.ndepth)
+        background = torch.tensor([0.,0.,0.],requires_grad=False).cuda()
         
-        if opts.debug:
-            torch.cuda.synchronize()
-            print('set input + render time:%.2f'%(time.time()-start_time))
-
-        # image and silhouette loss
-        sil_at_samp = rendered['sil_at_samp']
-        sil_at_samp_flo = rendered['sil_at_samp_flo']
-        vis_at_samp = rendered['vis_at_samp']
-
-        if opts.loss_flt:
-            # frame-level rejection of bad segmentations
-            if opts.lineload:
-                invalid_idx = loss_filter_line(self.latest_vars['sil_err'],
-                                               self.errid.long(),self.frameid.long(),
-                                               rendered['sil_loss_samp']*opts.sil_wt,
-                                               opts.img_size)
-            else:
-                sil_err, invalid_idx = loss_filter(self.latest_vars['sil_err'], 
-                                             rendered['sil_loss_samp']*opts.sil_wt,
-                                             sil_at_samp>-1, scale_factor=10)
-                self.latest_vars['sil_err'][self.errid.long()] = sil_err
-            
-            if self.progress > (opts.warmup_steps):
-                rendered['sil_loss_samp'][invalid_idx] *= 0.
-                if invalid_idx.sum()>0:
-                    print('%d removed from sil'%(invalid_idx.sum()))
+        rendered = self.main_render(rtk,(H,W),embedid,background=background,canonical=False)
+        aux_out = rendered
+        image = rendered['render']
+        mask = rendered['mask']
+        gt_image = batch['img'].squeeze().cuda().float()
+        gt_mask = batch['mask'].squeeze().cuda().float()
+        # import pdb;pdb.set_trace()
+        gt_image = gt_image*gt_mask+(1.-gt_mask)*(background[...,None,None])
+        Ll1 = l1_loss(image*gt_mask, gt_image)
+        lambda_dssim = 0.2
         
-        img_loss_samp = opts.img_wt*rendered['img_loss_samp']
-        if opts.loss_flt:
-            img_loss_samp[invalid_idx] *= 0
-        img_loss = img_loss_samp
-        if opts.rm_novp:
-            img_loss = img_loss * rendered['sil_coarse'].detach()
-        img_loss = img_loss[sil_at_samp[...,0]>0].mean() # eval on valid pts
-        sil_loss_samp = opts.sil_wt*rendered['sil_loss_samp']
-        sil_loss = sil_loss_samp[vis_at_samp>0].mean()
-        aux_out['sil_loss'] = sil_loss
-        aux_out['img_loss'] = img_loss
+        
+        # image loss
+        img_loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim((image)[None,...], (gt_image)[None,...]))
+        aux_out['img_loss'] = img_loss.data
         total_loss = img_loss
-        total_loss = total_loss + sil_loss 
-          
-        # feat rnd loss
-        frnd_loss_samp = opts.frnd_wt*rendered['frnd_loss_samp']
-        if opts.loss_flt:
-            frnd_loss_samp[invalid_idx] *= 0
-        if opts.rm_novp:
-            frnd_loss_samp = frnd_loss_samp * rendered['sil_coarse'].detach()
-        feat_rnd_loss = frnd_loss_samp[sil_at_samp[...,0]>0].mean() # eval on valid pts
-        aux_out['feat_rnd_loss'] = feat_rnd_loss
-        total_loss = total_loss + feat_rnd_loss
-  
-        # flow loss
-        if opts.use_corresp:
-            flo_loss_samp = rendered['flo_loss_samp']
-            if opts.loss_flt:
-                flo_loss_samp[invalid_idx] *= 0
-            if opts.rm_novp:
-                flo_loss_samp = flo_loss_samp * rendered['sil_coarse'].detach()
-
-            # eval on valid pts
-            flo_loss = flo_loss_samp[sil_at_samp_flo[...,0]].mean() * 2
-            #flo_loss = flo_loss_samp[sil_at_samp_flo[...,0]].mean()
-            flo_loss = flo_loss * opts.flow_wt
-    
-            # warm up by only using flow loss to optimize root pose
-            if self.loss_select == 0:
-                total_loss = total_loss*0. + flo_loss
-            else:
-                total_loss = total_loss + flo_loss
-            aux_out['flo_loss'] = flo_loss
         
-        # viser loss
-        if opts.use_embed:
-            feat_err_samp = rendered['feat_err']* opts.feat_wt
-            if opts.loss_flt:
-                feat_err_samp[invalid_idx] *= 0
+        
+        # if img_loss.data < 0.01:
+        #     cv2.imwrite('test.png',(image.moveaxis(0,-1)*255.)[:,:,[2,1,0]].detach().cpu().numpy())
+        #     cv2.imwrite('origin.png',(gt_image.moveaxis(0,-1)*255.)[:,:,[2,1,0]].detach().cpu().numpy())
+        #     cv2.imwrite('mask.png',(mask.unsqueeze(-1)*255.)[:,:,[0,0,0]].detach().cpu().numpy())
+        
+        mask_loss = l1_loss(mask,gt_mask)
+        mask_weight = 0.1
+        total_loss += mask_loss*mask_weight
+        aux_out['mask_loss'] = mask_loss.data
+        
+        
             
-            feat_loss = feat_err_samp
-            if opts.rm_novp:
-                feat_loss = feat_loss * rendered['sil_coarse'].detach()
-            feat_loss = feat_loss[sil_at_samp>0].mean()
-            total_loss = total_loss + feat_loss
-            aux_out['feat_loss'] = feat_loss
-            aux_out['beta_feat'] = self.nerf_feat.beta.clone().detach()[0]
-
-        
-        if opts.use_proj:
-            proj_err_samp = rendered['proj_err']* opts.proj_wt
-            if opts.loss_flt:
-                proj_err_samp[invalid_idx] *= 0
-
-            proj_loss = proj_err_samp[sil_at_samp>0].mean()
-            aux_out['proj_loss'] = proj_loss
-            if opts.freeze_proj:
-                total_loss = total_loss + proj_loss
-                ## warm up by only using projection loss to optimize bones
-                warmup_weight = (self.progress - opts.proj_start)/(opts.proj_end-opts.proj_start)
-                warmup_weight = (warmup_weight - 0.8) * 5 #  [-4,1]
-                warmup_weight = np.clip(warmup_weight, 0,1)
-                if (self.progress > opts.proj_start and \
-                    self.progress < opts.proj_end):
-                    total_loss = total_loss*warmup_weight + \
-                               10*proj_loss*(1-warmup_weight)
-            else:
-                # only add it after feature volume is trained well
-                total_loss = total_loss + proj_loss
-        
-        # regularization 
-        if 'frame_cyc_dis' in rendered.keys():
-            # cycle loss
-            cyc_loss = rendered['frame_cyc_dis'].mean()
-            total_loss = total_loss + cyc_loss * opts.cyc_wt
-            #total_loss = total_loss + cyc_loss*0
-            aux_out['cyc_loss'] = cyc_loss
-
-            # globally rigid prior
-            rig_loss = 0.0001*rendered['frame_rigloss'].mean()
-            if opts.rig_loss:
-                total_loss = total_loss + rig_loss
-            else:
-                total_loss = total_loss + rig_loss*0
-            aux_out['rig_loss'] = rig_loss
-
-            # elastic energy for se3 field / translation field
-            if 'elastic_loss' in rendered.keys():
-                elastic_loss = rendered['elastic_loss'].mean() * 1e-3
-                total_loss = total_loss + elastic_loss
-                aux_out['elastic_loss'] = elastic_loss
-
-        # regularization of root poses
-        if opts.root_sm:
-            root_sm_loss = compute_root_sm_2nd_loss(rtk_all, self.data_offset)
-            aux_out['root_sm_loss'] = root_sm_loss
-            total_loss = total_loss + root_sm_loss
-
-
-        if opts.eikonal_wt > 0:
-            ekl_loss = opts.eikonal_wt * eikonal_loss(self.nerf_coarse, self.embedding_xyz, 
-                        rendered['xyz_canonical_vis'], self.latest_vars['obj_bound'])
-            aux_out['ekl_loss'] = ekl_loss
-            total_loss = total_loss + ekl_loss
-
-        # bone location regularization: pull bones away from empth space (low sdf)
-        if opts.lbs and opts.bone_loc_reg>0:
-            bones_rst = self.bones
-            bones_rst,_ = correct_bones(self, bones_rst)
-            mesh_rest = self.latest_vars['mesh_rest']
-            if len(mesh_rest.vertices)>100: # not a degenerate mesh
-                # issue #4 the following causes error on certain archs for torch110+cu113
-                # seems to be a conflict between geomloss and pytorch3d
-                # mesh_rest = pytorch3d.structures.meshes.Meshes(
-                #         verts=torch.Tensor(mesh_rest.vertices[None]),
-                #         faces=torch.Tensor(mesh_rest.faces[None]))
-                # a ugly workaround 
-                mesh_verts = [torch.Tensor(mesh_rest.vertices)]
-                mesh_faces = [torch.Tensor(mesh_rest.faces).long()]
-                try:
-                    mesh_rest = pytorch3d.structures.meshes.Meshes(verts=mesh_verts, faces=mesh_faces)
-                except:
-                    mesh_rest = pytorch3d.structures.meshes.Meshes(verts=mesh_verts, faces=mesh_faces)
-                shape_samp = pytorch3d.ops.sample_points_from_meshes(mesh_rest,
-                                        1000, return_normals=False)
-                shape_samp = shape_samp[0].to(self.device)
-                from geomloss import SamplesLoss
-                samploss = SamplesLoss(loss="sinkhorn", p=2, blur=.05)
-                bone_loc_loss = samploss(bones_rst[:,:3]*10, shape_samp*10)
-                bone_loc_loss = opts.bone_loc_reg*bone_loc_loss
-                total_loss = total_loss + bone_loc_loss
-                aux_out['bone_loc_loss'] = bone_loc_loss
-            
-        # visibility loss
-        if 'vis_loss' in rendered.keys():
-            vis_loss = 0.01*rendered['vis_loss'].mean()
-            total_loss = total_loss + vis_loss
-            aux_out['visibility_loss'] = vis_loss
-
-        # uncertainty MLP inference
-        if opts.use_unc:
-            # add uncertainty MLP loss, loss = | |img-img_r|*sil - unc_pred |
-            unc_pred = rendered['unc_pred']
-            unc_rgb = sil_at_samp[...,0]*img_loss_samp.mean(-1)
-            unc_feat= (sil_at_samp*feat_err_samp)[...,0]
-            unc_proj= (sil_at_samp*proj_err_samp)[...,0]
-            unc_sil = sil_loss_samp[...,0]
-            #unc_accumulated = unc_feat + unc_proj
-            #unc_accumulated = unc_feat + unc_proj + unc_rgb*0.1
-#            unc_accumulated = unc_feat + unc_proj + unc_rgb
-            unc_accumulated = unc_rgb
-#            unc_accumulated = unc_rgb + unc_sil
-
-            unc_loss = (unc_accumulated.detach() - unc_pred[...,0]).pow(2)
-            unc_loss = unc_loss.mean()
-            aux_out['unc_loss'] = unc_loss
-            total_loss = total_loss + unc_loss
-
-
-        # cse feature tuning
-        if opts.ft_cse and opts.mt_cse:
-            csenet_loss = (self.csenet_feats - self.csepre_feats).pow(2).sum(1)
-            csenet_loss = csenet_loss[self.dp_feats_mask].mean()* 1e-5
-            if self.progress < opts.mtcse_steps:
-                total_loss = total_loss*0 + csenet_loss
-            else:
-                total_loss = total_loss + csenet_loss
-            aux_out['csenet_loss'] = csenet_loss
-
-        if opts.freeze_coarse:
-            # compute nerf xyz wt loss
-            shape_xyz_wt_curr = grab_xyz_weights(self.nerf_coarse)
-            shape_xyz_wt_loss = 100*compute_xyz_wt_loss(self.shape_xyz_wt, 
-                                                         shape_xyz_wt_curr)
-            skin_xyz_wt_curr = grab_xyz_weights(self.nerf_skin)
-            skin_xyz_wt_loss = 100*compute_xyz_wt_loss(self.skin_xyz_wt, 
-                                                        skin_xyz_wt_curr)
-            feat_xyz_wt_curr = grab_xyz_weights(self.nerf_feat)
-            feat_xyz_wt_loss = 100*compute_xyz_wt_loss(self.feat_xyz_wt, 
-                                                        feat_xyz_wt_curr)
-            aux_out['shape_xyz_wt_loss'] = shape_xyz_wt_loss
-            aux_out['skin_xyz_wt_loss'] = skin_xyz_wt_loss
-            aux_out['feat_xyz_wt_loss'] = feat_xyz_wt_loss
-            total_loss = total_loss + shape_xyz_wt_loss + skin_xyz_wt_loss\
-                    + feat_xyz_wt_loss
-
         # save some variables
         if opts.lbs:
             aux_out['skin_scale'] = self.skin_aux[0].clone().detach()
             aux_out['skin_const'] = self.skin_aux[1].clone().detach()
+
         
-        total_loss = total_loss * opts.total_wt
-        aux_out['total_loss'] = total_loss
-        aux_out['beta'] = self.nerf_coarse.beta.clone().detach()[0]
-        if opts.debug:
-            torch.cuda.synchronize()
-            print('set input + render + loss time:%.2f'%(time.time()-start_time))
+        # if opts.rm_novp:
+        #     img_loss = img_loss * rendered['sil_coarse'].detach()
+        # img_loss = img_loss[sil_at_samp[...,0]>0].mean() # eval on valid pts
+        # sil_loss_samp = opts.sil_wt*rendered['sil_loss_samp']
+        # sil_loss = sil_loss_samp[vis_at_samp>0].mean()
+        # aux_out['sil_loss'] = sil_loss
+        # aux_out['img_loss'] = img_loss
+        # total_loss = img_loss
+        # total_loss = total_loss + sil_loss 
+          
+        # feat rnd loss
+        # frnd_loss_samp = opts.frnd_wt*rendered['frnd_loss_samp']
+        # if opts.loss_flt:
+        #     frnd_loss_samp[invalid_idx] *= 0
+        # if opts.rm_novp:
+        #     frnd_loss_samp = frnd_loss_samp * rendered['sil_coarse'].detach()
+        # feat_rnd_loss = frnd_loss_samp[sil_at_samp[...,0]>0].mean() # eval on valid pts
+        # aux_out['feat_rnd_loss'] = feat_rnd_loss
+        # total_loss = total_loss + feat_rnd_loss
+  
+        # flow loss
+        # if opts.use_corresp:
+        #     flo_loss_samp = rendered['flo_loss_samp']
+        #     if opts.rm_novp:
+        #         flo_loss_samp = flo_loss_samp * rendered['sil_coarse'].detach()
+
+        #     # eval on valid pts
+        #     flo_loss = flo_loss_samp[sil_at_samp_flo[...,0]].mean() * 2
+        #     #flo_loss = flo_loss_samp[sil_at_samp_flo[...,0]].mean()
+        #     flo_loss = flo_loss * opts.flow_wt
+    
+        #     # warm up by only using flow loss to optimize root pose
+        #     if self.loss_select == 0:
+        #         total_loss = total_loss*0. + flo_loss
+        #     else:
+        #         total_loss = total_loss + flo_loss
+        #     aux_out['flo_loss'] = flo_loss
+        
+        
+        
+        # # regularization 
+        # if 'frame_cyc_dis' in rendered.keys():
+        #     # cycle loss
+        #     cyc_loss = rendered['frame_cyc_dis'].mean()
+        #     total_loss = total_loss + cyc_loss * opts.cyc_wt
+        #     #total_loss = total_loss + cyc_loss*0
+        #     aux_out['cyc_loss'] = cyc_loss
+
+        #     # globally rigid prior
+        #     rig_loss = 0.0001*rendered['frame_rigloss'].mean()
+        #     if opts.rig_loss:
+        #         total_loss = total_loss + rig_loss
+        #     else:
+        #         total_loss = total_loss + rig_loss*0
+        #     aux_out['rig_loss'] = rig_loss
+
+        #     # elastic energy for se3 field / translation field
+        #     if 'elastic_loss' in rendered.keys():
+        #         elastic_loss = rendered['elastic_loss'].mean() * 1e-3
+        #         total_loss = total_loss + elastic_loss
+        #         aux_out['elastic_loss'] = elastic_loss
+
+        # regularization of root poses
+        if opts.root_sm:
+            root_sm_loss_1st = compute_root_sm_loss(rtk_all, self.data_offset)
+            root_sm_loss_2nd = compute_root_sm_2nd_loss(rtk_all, self.data_offset)
+            aux_out['root_sm_1st_loss'] = root_sm_loss_1st
+            aux_out['root_sm_2nd_loss'] = root_sm_loss_2nd
+            total_loss = total_loss + root_sm_loss_1st*10 + root_sm_loss_2nd
+
+
+        # if opts.eikonal_wt > 0:
+        #     ekl_loss = opts.eikonal_wt * eikonal_loss(self.nerf_coarse, self.embedding_xyz, 
+        #                 rendered['xyz_canonical_vis'], self.latest_vars['obj_bound'])
+        #     aux_out['ekl_loss'] = ekl_loss
+        #     total_loss = total_loss + ekl_loss
+            
+
+
+        
+        
+        # total_loss = total_loss * opts.total_wt
+        # aux_out['total_loss'] = total_loss
+        # aux_out['beta'] = self.nerf_coarse.beta.clone().detach()[0]
+        # if opts.debug:
+        #     torch.cuda.synchronize()
+        #     print('set input + render + loss time:%.2f'%(time.time()-start_time))
         return total_loss, aux_out
+
 
     def forward_warmup_rootmlp(self, batch):
         """
@@ -790,84 +716,7 @@ class banmo(nn.Module):
 
         return total_loss, aux_out
     
-    def nerf_render(self, rtk, kaug, embedid, nsample=256, ndepth=128):
-        opts=self.opts
-        # render rays
-        if opts.debug:
-            torch.cuda.synchronize()
-            start_time = time.time()
-
-        # 2bs,...
-        Rmat, Tmat, Kinv = self.prepare_ray_cams(rtk, kaug)
-        bs = Kinv.shape[0]
-        
-        # for batch:2bs,            nsample+x
-        # for line: 2bs*(nsample+x),1
-        rand_inds, rays, frameid, errid = self.sample_pxs(bs, nsample, Rmat, Tmat, Kinv,
-        self.dataid, self.frameid, self.frameid_sub, self.embedid,self.lineid,self.errid,
-        self.imgs, self.masks, self.vis2d, self.flow, self.occ, self.dp_feats)
-        self.frameid = frameid # only used in loss filter
-        self.errid = errid
-
-
-        if opts.debug:
-            torch.cuda.synchronize()
-            print('prepare rays time: %.2f'%(time.time()-start_time))
-
-        bs_rays = rays['bs'] * rays['nsample'] # over pixels
-        results=defaultdict(list)
-        for i in range(0, bs_rays, opts.chunk):
-            rays_chunk = chunk_rays(rays,i,opts.chunk)
-            # decide whether to use fine samples 
-            if self.progress > opts.fine_steps:
-                self.use_fine = True
-            else:
-                self.use_fine = False
-            rendered_chunks = render_rays(self.nerf_models,
-                        self.embeddings,
-                        rays_chunk,
-                        N_samples = ndepth,
-                        use_disp=False,
-                        perturb=opts.perturb,
-                        noise_std=opts.noise_std,
-                        chunk=opts.chunk, # chunk size is effective in val mode
-                        obj_bound=self.latest_vars['obj_bound'],
-                        use_fine=self.use_fine,
-                        img_size=self.img_size,
-                        progress=self.progress,
-                        opts=opts,
-                        )
-            for k, v in rendered_chunks.items():
-                results[k] += [v]
-        
-        for k, v in results.items():
-            if v[0].dim()==0: # loss
-                v = torch.stack(v).mean()
-            else:
-                v = torch.cat(v, 0)
-                if self.training:
-                    v = v.view(rays['bs'],rays['nsample'],-1)
-                else:
-                    v = v.view(bs,self.img_size, self.img_size, -1)
-            results[k] = v
-        if opts.debug:
-            torch.cuda.synchronize()
-            print('rendering time: %.2f'%(time.time()-start_time))
-        
-        # viser feature matching
-        if opts.use_embed:
-            results['pts_pred'] = (results['pts_pred'] - torch.Tensor(self.vis_min[None]).\
-                    to(self.device)) / torch.Tensor(self.vis_len[None]).to(self.device)
-            results['pts_exp']  = (results['pts_exp'] - torch.Tensor(self.vis_min[None]).\
-                    to(self.device)) / torch.Tensor(self.vis_len[None]).to(self.device)
-            results['pts_pred'] = results['pts_pred'].clamp(0,1)
-            results['pts_exp']  = results['pts_exp'].clamp(0,1)
-
-        if opts.debug:
-            torch.cuda.synchronize()
-            print('compute flow time: %.2f'%(time.time()-start_time))
-        return results, rand_inds
-
+    
     
     @staticmethod
     def render_dp(dp_verts_unit, dp_faces, dp_embed, near_far, device, 
@@ -1137,7 +986,7 @@ class banmo(nn.Module):
         # need to reshape dataid, frameid_sub, embedid #TODO embedid equiv to frameid
         self.update_rays(rays, bs>1, dataid, frameid_sub, frameid, xys, Kinv)
         
-        if 'bones' in self.nerf_models.keys():
+        if 'bones' in self.networks.keys():
             # update delta rts fw
             self.update_delta_rts(rays)
         
@@ -1209,8 +1058,8 @@ class banmo(nn.Module):
         change bone_rts_fw to delta fw
         """
         opts = self.opts
-        bones_rst, bone_rts_rst = correct_bones(self, self.nerf_models['bones'])
-        self.nerf_models['bones_rst']=bones_rst
+        bones_rst, bone_rts_rst = correct_bones(self, self.networks['bones'])
+        self.networks['bones_rst']=bones_rst
 
         # delta rts
         rays['bone_rts'] = correct_rest_pose(opts, rays['bone_rts'], bone_rts_rst)
@@ -1311,7 +1160,10 @@ class banmo(nn.Module):
             bs,_,_,h,w = batch['img'].shape
         # convert to float
         for k,v in batch.items():
-            batch[k] = batch[k].float()
+            try:
+                batch[k] = batch[k].float()
+            except:
+                pass
 
         img_tensor = batch['img'].view(bs,-1,3,h,w).permute(1,0,2,3,4).reshape(-1,3,h,w)
         input_img_tensor = img_tensor.clone()
@@ -1357,6 +1209,33 @@ class banmo(nn.Module):
         self.flow = batch['flow'].view(bs,-1,2,h,w).permute(1,0,2,3,4).reshape(-1,2,h,w).to(device)
         self.occ  = batch['occ'].view(bs,-1,h,w).permute(1,0,2,3).reshape(-1,h,w)     .to(device)
         self.lineid = None
+        
+    def convert_feat_input(self, batch):
+        device = self.device
+        opts = self.opts
+        bs = batch['frameid'].shape[0]
+        # convert to float
+        for k,v in batch.items():
+            batch[k] = batch[k].float()
+
+        # self.dps          = batch['dp']          .view(bs,-1,h,w).permute(1,0,2,3).reshape(-1,h,w)      .to(device)
+        dpfd = 16
+        dpfs = 112
+        self.dp_feats     = batch['dp_feat']     .view(bs,-1,dpfd,dpfs,dpfs).permute(1,0,2,3,4).reshape(-1,dpfd,dpfs,dpfs).to(device)
+        self.dp_bbox      = batch['dp_bbox']     .view(bs,-1,4).permute(1,0,2).reshape(-1,4)          .to(device)
+        self.dp_feats     = F.normalize(self.dp_feats, 2,1)
+        self.rtk          = batch['rtk']         .view(bs,-1,4,4).permute(1,0,2,3).reshape(-1,4,4)    .to(device)
+        self.kaug         = batch['kaug']        .view(bs,-1,4).permute(1,0,2).reshape(-1,4)          .to(device)
+        self.frameid      = batch['frameid']     .view(bs,-1).permute(1,0).reshape(-1).cpu()
+        self.dataid       = batch['dataid']      .view(bs,-1).permute(1,0).reshape(-1).cpu()
+      
+        self.frameid_sub = self.frameid.clone() # id within a video
+        self.embedid = self.frameid + self.data_offset[self.dataid.long()]
+        self.frameid = self.frameid + self.data_offset[self.dataid.long()]
+        self.errid = self.frameid # for err filter
+        self.rt_raw  = self.rtk.clone()[:,:3]
+
+        self.lineid = None
     
     def convert_root_pose(self):
         """
@@ -1373,7 +1252,7 @@ class banmo(nn.Module):
             self.rtk[:,:3,3] = self.rtk[:,:3,3] / self.obj_scale
         else:
             self.rtk[:,:3] = self.create_base_se3(bs, device)
-
+  
         # compute delta pose
         if self.opts.root_opt:
             if self.root_basis == 'cnn':
@@ -1406,7 +1285,7 @@ class banmo(nn.Module):
         rt_raw[:,:3,3] = tmat
         return rt_raw
       
-    def compute_rts(self):
+    def compute_rts(self,frameid=None):
         """
         Assumpions
         - use_cam
@@ -1416,14 +1295,15 @@ class banmo(nn.Module):
         """
         device = self.device
         opts = self.opts
-        frameid = torch.Tensor(range(self.num_fr)).to(device).long()
+        if frameid is None:
+            frameid = torch.Tensor(range(self.num_fr)).to(device).long()
 
         if self.use_cam:
             # scale initial poses
             rt_raw = torch.Tensor(self.latest_vars['rt_raw']).to(device)
             rt_raw[:,:3,3] = rt_raw[:,:3,3] / self.obj_scale
         else:
-            rt_raw = self.create_base_se3(self.num_fr, device)
+            rt_raw = self.create_base_se3(frameid.shape[0], device)
         
         # compute mlp rts
         if opts.root_opt:
@@ -1451,35 +1331,94 @@ class banmo(nn.Module):
         # TODO don't want to save k at eval time (due to different intrinsics)
         self.latest_vars['rtk'][self.frameid.long()] = rtk.cpu().numpy()
         self.latest_vars['rt_raw'][self.frameid.long()] = self.rt_raw.cpu().numpy()
+        self.latest_vars['kaug'][self.frameid.long()] = self.kaug.cpu().numpy()
         self.latest_vars['idk'][self.frameid.long()] = 1
 
     def set_input(self, batch, load_line=False):
         device = self.device
         opts = self.opts
 
-        if load_line:
-            self.convert_line_input(batch)
-        else:
-            self.convert_batch_input(batch)
+        
+        self.convert_batch_input(batch)
         bs = self.imgs.shape[0]
         
         self.convert_root_pose()
       
         self.save_latest_vars()
         
-        if opts.lineload and self.training:
-            self.dp_feats = self.dp_feats
-        else:
-            self.dp_feats = resample_dp(self.dp_feats, 
-                    self.dp_bbox, self.kaug, self.img_size)
+        # if opts.lineload and self.training:
+        #     self.dp_feats = self.dp_feats
+        # else:
+        #     self.dp_feats = resample_dp(self.dp_feats, 
+        #             self.dp_bbox, self.kaug, self.img_size)
         
-        if self.training and self.opts.anneal_freq:
-            alpha = self.num_freqs * \
-                self.progress / (opts.warmup_steps)
-            #if alpha>self.alpha.data[0]:
-            self.alpha.data[0] = min(max(6, alpha),self.num_freqs) # alpha from 6 to 10
-            self.embedding_xyz.alpha = self.alpha.data[0]
-            self.embedding_dir.alpha = self.alpha.data[0]
+        # if self.training and self.opts.anneal_freq:
+        #     alpha = self.num_freqs * \
+        #         self.progress / (opts.warmup_steps)
+        #     #if alpha>self.alpha.data[0]:
+        #     self.alpha.data[0] = min(max(6, alpha),self.num_freqs) # alpha from 6 to 10
+        #     self.embedding_xyz.alpha = self.alpha.data[0]
+        #     self.embedding_dir.alpha = self.alpha.data[0]
 
         return bs
 
+    def save_imgs(self,savedir,epoch,vid=5,use_deform=True,novel_cam=False,fixed_cam=False,save_img=True,save_video=True):
+        if vid ==-1: vid=5
+        opts = self.opts
+        rtks = self.compute_rts()[self.data_offset[vid]:self.data_offset[vid+1],:,:].cuda()
+        # kaugs = self.latest_vars['kaug'][self.data_offset[vid]:self.data_offset[vid+1],:]
+        # rtk = torch.Tensor(rtk).to(self.device)
+        sample_idx = np.linspace(0,len(rtks)-1, len(rtks)).astype(int)
+        img_size = self.img_size
+        bs = len(rtks)
+        # near_far = self.near_far[self.data_offset[vid]:self.data_offset[vid+1],:]
+        # embedid = torch.Tensor(sample_idx).to(self.device).long() + \
+        #         self.data_offset[vid]
+        rgbs = []
+        prefix = 'origin'
+        if novel_cam:
+            prefix = 'novel'
+        if fixed_cam:
+            prefix = 'fix'
+        #import pdb;pdb.set_trace()
+        target = [0,10,20,30,40,50,60,70]
+        H=1080
+        W=1920
+        if save_video:
+            target = range(bs)
+        for i in tqdm(target):
+            rtk = torch.cat([rtks[i],self.ks_param[vid][None,...]],dim=0)
+            Rmat = rtk[:3,:3]
+            Tmat = rtk[:3,3]
+            K = rtk[3,:]
+            cam_r = 1.
+            if fixed_cam:
+                angle = 0.
+                Rmat = torch.inverse(torch.tensor([[np.sin(angle),0.,np.cos(angle)],
+                                        [0.,-1.,0.],
+                                        [-np.cos(angle),0.,np.sin(angle)]]))
+                Tmat = torch.tensor([0.,0.,1.])*cam_r
+                K = torch.tensor([[1024.,1024.,256.,256.]])
+                H=W=512
+            
+            if novel_cam:
+                angle = np.pi*2*i/bs
+                Rmat = torch.inverse(torch.tensor([[np.sin(angle),0.,np.cos(angle)],
+                                        [0.,-1.,0.],
+                                        [-np.cos(angle),0.,np.sin(angle)]]))
+                Tmat = torch.tensor([0.,0.,1.])*cam_r
+                K = torch.tensor([1024.,1024.,256.,256.])
+                H=W=512
+            
+            rtk[:3,:3] = Rmat
+            rtk[:3,3] = Tmat
+            rtk[3,:] = K
+            background = torch.tensor([0.,0.,0.]).cuda()
+            results = self.main_render(rtk,(H,W),torch.tensor([i+self.data_offset[vid]],device=rtk.device),background=background,canonical=not use_deform)
+            
+            rgb = results['render'].moveaxis(0,-1).cpu().numpy()
+            rgbs.append(rgb)
+            if save_img:
+                cv2.imwrite('%s/%s_%03d_%05d.png'%(savedir,prefix,epoch,i), rgb[...,::-1]*255)
+        if save_video:
+            save_vid('%s/%s_%03d'%(savedir,prefix,epoch), rgbs, suffix='.mp4',upsample_frame=0)

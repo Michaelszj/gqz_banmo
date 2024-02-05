@@ -28,6 +28,7 @@ def render_rays(models,
                 progress=None,
                 opts=None,
                 render_vis=False,
+                fine_iter=True
                 ):
     """
     Render rays by computing the output of @model applied on @rays
@@ -115,7 +116,7 @@ def render_rays(models,
                           chunk, N_samples,
                           N_rays, embedding_xyz, rays_d, noise_std,
                           obj_bound, dir_embedded, z_vals,
-                          img_size, progress,opts,render_vis=render_vis)
+                          img_size, progress,opts,render_vis=render_vis,fine_iter=fine_iter)
 
     return result
     

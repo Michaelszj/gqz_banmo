@@ -225,6 +225,7 @@ def skinning_chunk(bones, pts, dskin=None, skin_aux=None):
 
     # mahalanobis distance [(p-v)^TR^T]S[R(p-v)]
     # transform a vector to the local coordinate
+    # import pdb;pdb.set_trace()
     mdis = center.view(bs,1,B,3) - pts.view(bs,N,1,3) # bs,N,B,3
     mdis = axis_rotate(orient.view(bs,1,B,3,3), mdis[...,None])
     mdis = mdis[...,0]
@@ -603,7 +604,7 @@ def sample_xy(img_size, bs, nsample, device, return_all=False, lineid=None):
     xys:        bs, ns, 2
     """
     xygrid = np.meshgrid(range(img_size), range(img_size))  # w,h->hxw
-    xygrid = torch.Tensor(xygrid).to(device)  # (x,y)
+    xygrid = torch.Tensor(np.array(xygrid)).to(device)  # (x,y)
     xygrid = xygrid.permute(1,2,0).reshape(1,-1,2)  # 1,..., 2
     
     if return_all:
@@ -656,7 +657,7 @@ def generate_bones(num_bones_x, num_bones, bound, device):
     bones = torch.cat([center, orient, scale],-1)
     return bones
 
-def reinit_bones(model, mesh, num_bones):
+def reinit_bones(model, vertices, num_bones):
     """
     update the data of bones and nerf_body_rts[1].rgb without add new parameters
     num_bones: number of bones on the surface
@@ -666,7 +667,7 @@ def reinit_bones(model, mesh, num_bones):
     #TODO find another way to add/delete bones
     from kmeans_pytorch import kmeans
     device = model.device
-    points = torch.Tensor(mesh.vertices).to(device)
+    points = vertices.detach()
     rthead = model.nerf_body_rts[1].rgb
     
     # reinit
@@ -676,7 +677,7 @@ def reinit_bones(model, mesh, num_bones):
     torch.nn.init.zeros_(rthead[0].bias)
 
     if points.shape[0]<100:
-        bound = model.latest_vars['obj_bound']
+        bound = model.bound
         bound = torch.Tensor(bound)[None]
         center = torch.rand(num_bones, 3) *  bound*2 - bound
     else:
@@ -697,7 +698,7 @@ def reinit_bones(model, mesh, num_bones):
     
     bones,_ = correct_bones(model, bones, inverse=True)
     model.bones.data[:num_bones] = bones
-    model.nerf_models['bones'] = model.bones
+    model.networks['bones'] = model.bones
     return
 
 def correct_bones(model, bones_rst, inverse=False):
@@ -1427,7 +1428,7 @@ def resample_dp(dp_feats, dp_bbox, kaug, target_size):
         xygrid = sample_xy(target_size, 1, 0, device, return_all=True)[1] 
         xygrid = xygrid.matmul(rnd2dp[:,:2,:2]) + rnd2dp[:,None,:2,2]
         xygrid = xygrid / dp_size * 2 - 1 
-        dp_feats_rsmp = F.grid_sample(dp_feats, xygrid.view(-1,target_size,target_size,2))
+        dp_feats_rsmp = F.grid_sample(dp_feats, xygrid.view(-1,target_size,target_size,2),align_corners=True)
     return dp_feats_rsmp
 
 

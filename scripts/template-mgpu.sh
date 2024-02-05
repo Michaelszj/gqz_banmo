@@ -10,9 +10,7 @@ seqname=$3
 address=$4
 add_args=${*: 4:$#-1}
 
-CUDA_VISIBLE_DEVICES=$dev python -m torch.distributed.launch\
-                    --master_port $address \
-                    --nproc_per_node=$ngpu main.py \
+CUDA_VISIBLE_DEVICES=$dev python main.py \
                     --ngpu $ngpu \
                     --seqname $seqname \
                     --logname $logname \

@@ -232,7 +232,7 @@ def draw_cams(all_cam, color='cool', axis=True,
                                         axis_radius = radius* 0.1,
                                         axis_length = radius*5)
             #extents=extents)
-            #axis.vertices[:,2] += radius * 5
+            axis.vertices[:,2] = axis.vertices[:,2]*2.
             #cam = trimesh.util.concatenate([elips, axis])
             cam = axis
 

@@ -30,21 +30,21 @@ from collections import defaultdict
 from pytorch3d import transforms
 from torch.nn.utils import clip_grad_norm_
 from matplotlib.pyplot import cm
-
+from tqdm import tqdm
 from nnutils.geom_utils import lbs, reinit_bones, warp_bw, warp_fw, vec_to_sim3,\
                                obj_to_cam, get_near_far, near_far_to_bound, \
                                compute_point_visibility, process_so3_seq, \
                                ood_check_cse, align_sfm_sim3, gauss_mlp_skinning, \
                                correct_bones
 from nnutils.nerf import grab_xyz_weights
-from ext_utils.flowlib import flow_to_image
+# from ext_utils.flowlib import flow_to_image
 from utils.io import mkdir_p
 from nnutils.vis_utils import image_grid
 from dataloader import frameloader
 from utils.io import save_vid, draw_cams, extract_data_info, merge_dict,\
         render_root_txt, save_bones, draw_cams_pair, get_vertex_colors
 from utils.colors import label_colormap
-
+from torch.utils.tensorboard import SummaryWriter
 class DataParallelPassthrough(torch.nn.parallel.DistributedDataParallel):
     """
     for multi-gpu access
@@ -68,8 +68,12 @@ class v2s_trainer():
         self.local_rank = opts.local_rank
         self.save_dir = os.path.join(opts.checkpoint_dir, opts.logname)
         
-        self.accu_steps = opts.accu_steps
-        
+        self.accu_steps = 5 # opts.accu_steps
+        name = "GSMo"
+        tb_writer_summary_path = os.path.join(opts.checkpoint_dir, "runs")
+        current_time = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        log_dir = os.path.join(tb_writer_summary_path, current_time)
+        self.writer = SummaryWriter(log_dir=log_dir, comment=name)
         # write logs
         if opts.local_rank==0:
             if not os.path.exists(self.save_dir): os.makedirs(self.save_dir)
@@ -90,19 +94,7 @@ class v2s_trainer():
         if opts.model_path!='':
             self.load_network(opts.model_path, is_eval=self.is_eval)
 
-        if self.is_eval:
-            self.model = self.model.to(self.device)
-        else:
-            # ddp
-            self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-            self.model = self.model.to(self.device)
-
-            self.model = DataParallelPassthrough(
-                    self.model,
-                    device_ids=[opts.local_rank],
-                    output_device=opts.local_rank,
-                    find_unused_parameters=True,
-            )
+        self.model = self.model.to(self.device)
         return
     
     def init_dataset(self):
@@ -126,17 +118,10 @@ class v2s_trainer():
                 opts_dict['rtk_path'] = cam_dir
 
         self.dataloader = frameloader.data_loader(opts_dict)
-        if opts.lineload:
-            opts_dict['lineload'] = True
-            opts_dict['multiply'] = True # multiple samples in dataset
-            self.trainloader = frameloader.data_loader(opts_dict)
-            opts_dict['lineload'] = False
-            del opts_dict['multiply']
-        else:
-            opts_dict['multiply'] = True
-            self.trainloader = frameloader.data_loader(opts_dict)
-            del opts_dict['multiply']
-        opts_dict['img_size'] = opts.render_size
+        # opts_dict['multiply'] = True
+        self.trainloader = frameloader.data_loader(opts_dict)
+        # del opts_dict['multiply']
+        # opts_dict['img_size'] = opts.render_size
         self.evalloader = frameloader.eval_loader(opts_dict)
 
         # compute data offset
@@ -146,19 +131,20 @@ class v2s_trainer():
     def init_training(self):
         opts = self.opts
         # set as module attributes since they do not change across gpus
-        self.model.module.final_steps = self.num_epochs * \
+        self.model.final_steps = self.num_epochs * \
                                 min(200,len(self.trainloader)) * opts.accu_steps
         # ideally should be greater than 200 batches
 
-        params_nerf_coarse=[]
-        params_nerf_beta=[]
-        params_nerf_feat=[]
-        params_nerf_beta_feat=[]
-        params_nerf_fine=[]
-        params_nerf_unc=[]
-        params_nerf_flowbw=[]
+        # params_nerf_coarse=[]
+        # params_nerf_beta=[]
+        # params_nerf_feat=[]
+        # params_nerf_beta_feat=[]
+        # params_nerf_fine=[]
+        # params_nerf_unc=[]
+        # params_nerf_flowbw=[]
         params_nerf_skin=[]
-        params_nerf_vis=[]
+        params_delta_net=[]
+        # params_nerf_vis=[]
         params_nerf_root_rts=[]
         params_nerf_body_rts=[]
         params_root_code=[]
@@ -168,27 +154,13 @@ class v2s_trainer():
         params_bones=[]
         params_skin_aux=[]
         params_ks=[]
-        params_nerf_dp=[]
-        params_csenet=[]
+        # params_nerf_dp=[]
+        # params_csenet=[]
         for name,p in self.model.named_parameters():
-            if 'nerf_coarse' in name and 'beta' not in name:
-                params_nerf_coarse.append(p)
-            elif 'nerf_coarse' in name and 'beta' in name:
-                params_nerf_beta.append(p)
-            elif 'nerf_feat' in name and 'beta' not in name:
-                params_nerf_feat.append(p)
-            elif 'nerf_feat' in name and 'beta' in name:
-                params_nerf_beta_feat.append(p)
-            elif 'nerf_fine' in name:
-                params_nerf_fine.append(p)
-            elif 'nerf_unc' in name:
-                params_nerf_unc.append(p)
-            elif 'nerf_flowbw' in name or 'nerf_flowfw' in name:
-                params_nerf_flowbw.append(p)
-            elif 'nerf_skin' in name:
+            if 'nerf_skin' in name:
                 params_nerf_skin.append(p)
-            elif 'nerf_vis' in name:
-                params_nerf_vis.append(p)
+            elif 'delta_net' in name:
+                params_delta_net.append(p)
             elif 'nerf_root_rts' in name:
                 params_nerf_root_rts.append(p)
             elif 'nerf_body_rts' in name:
@@ -201,30 +173,27 @@ class v2s_trainer():
                 params_env_code.append(p)
             elif 'vid_code' in name:
                 params_vid_code.append(p)
-            elif 'module.bones' == name:
+            elif 'bones' == name:
                 params_bones.append(p)
-            elif 'module.skin_aux' == name:
+            elif 'skin_aux' == name:
                 params_skin_aux.append(p)
-            elif 'module.ks_param' == name:
+            elif 'ks_param' == name:
                 params_ks.append(p)
-            elif 'nerf_dp' in name:
-                params_nerf_dp.append(p)
-            elif 'csenet' in name:
-                params_csenet.append(p)
             else: continue
             if opts.local_rank==0:
                 print('optimized params: %s'%name)
 
         self.optimizer = torch.optim.AdamW(
-            [{'params': params_nerf_coarse},
-             {'params': params_nerf_beta},
-             {'params': params_nerf_feat},
-             {'params': params_nerf_beta_feat},
-             {'params': params_nerf_fine},
-             {'params': params_nerf_unc},
-             {'params': params_nerf_flowbw},
+            [# {'params': params_nerf_coarse},
+            #  {'params': params_nerf_beta},
+            #  {'params': params_nerf_feat},
+            #  {'params': params_nerf_beta_feat},
+            #  {'params': params_nerf_fine},
+            #  {'params': params_nerf_unc},
+            #  {'params': params_nerf_flowbw},
              {'params': params_nerf_skin},
-             {'params': params_nerf_vis},
+            #  {'params': params_nerf_vis},
+             {'params': params_delta_net},
              {'params': params_nerf_root_rts},
              {'params': params_nerf_body_rts},
              {'params': params_root_code},
@@ -234,8 +203,8 @@ class v2s_trainer():
              {'params': params_bones},
              {'params': params_skin_aux},
              {'params': params_ks},
-             {'params': params_nerf_dp},
-             {'params': params_csenet},
+            #  {'params': params_nerf_dp},
+            #  {'params': params_csenet},
             ],
             lr=opts.learning_rate,betas=(0.9, 0.999),weight_decay=1e-4)
 
@@ -249,17 +218,18 @@ class v2s_trainer():
             lr_nerf_root_rts = 1 
         else: print('error'); exit()
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer,\
-                        [opts.learning_rate, # params_nerf_coarse
-                         opts.learning_rate, # params_nerf_beta
-                         opts.learning_rate, # params_nerf_feat
-                      10*opts.learning_rate, # params_nerf_beta_feat
-                         opts.learning_rate, # params_nerf_fine
-                         opts.learning_rate, # params_nerf_unc
-                         opts.learning_rate, # params_nerf_flowbw
+                        [# opts.learning_rate, # params_nerf_coarse
+                    #      opts.learning_rate, # params_nerf_beta
+                    #      opts.learning_rate, # params_nerf_feat
+                    #   10*opts.learning_rate, # params_nerf_beta_feat
+                    #      opts.learning_rate, # params_nerf_fine
+                    #      opts.learning_rate, # params_nerf_unc
+                    #      opts.learning_rate, # params_nerf_flowbw
                          opts.learning_rate, # params_nerf_skin
-                         opts.learning_rate, # params_nerf_vis
+                         10*opts.learning_rate, # params_delta_net
+                        #  opts.learning_rate, # params_nerf_vis
         lr_nerf_root_rts*opts.learning_rate, # params_nerf_root_rts
-                         opts.learning_rate, # params_nerf_body_rts
+                         10*opts.learning_rate, # params_nerf_body_rts
         lr_nerf_root_rts*opts.learning_rate, # params_root_code
                          opts.learning_rate, # params_pose_code
                          opts.learning_rate, # params_env_code
@@ -267,10 +237,10 @@ class v2s_trainer():
                          opts.learning_rate, # params_bones
                       10*opts.learning_rate, # params_skin_aux
                       10*opts.learning_rate, # params_ks
-                         opts.learning_rate, # params_nerf_dp
-                         opts.learning_rate, # params_csenet
+                        #  opts.learning_rate, # params_nerf_dp
+                        #  opts.learning_rate, # params_csenet
             ],
-            int(self.model.module.final_steps/self.accu_steps),
+            int(self.model.final_steps/self.accu_steps),
             pct_start=2./self.num_epochs, # use 2 epochs to warm up
             cycle_momentum=False, 
             anneal_strategy='linear',
@@ -380,20 +350,24 @@ class v2s_trainer():
         idx_render: list of frame index to render
         """
         opts = self.opts
+        
         with torch.no_grad():
             self.model.eval()
             # load data
             for dataset in self.evalloader.dataset.datasets:
                 dataset.load_pair = False
+                dataset.feat_only = True
             batch = []
             for i in idx_render:
                 batch.append( self.evalloader.dataset[i] )
+            # import pdb;pdb.set_trace()
             batch = self.evalloader.collate_fn(batch)
             for dataset in self.evalloader.dataset.datasets:
                 dataset.load_pair = True
+                dataset.feat_only = False
 
             #TODO can be further accelerated
-            self.model.convert_batch_input(batch)
+            self.model.convert_feat_input(batch)
 
             if opts.unc_filter:
                 # process densepoe feature
@@ -423,13 +397,13 @@ class v2s_trainer():
                        'impath':[],
                        'masks':[],
                        }
+            if opts.local_rank==0: 
+                    print(f'extracting frame {idx_render[0]} to {idx_render[-1]}')
             for idx,_ in enumerate(idx_render):
                 frameid=self.model.frameid[idx]
-                if opts.local_rank==0: 
-                    print('extracting frame %d'%(frameid.cpu().numpy()))
                 aux_seq['rtk'].append(rtk[idx].cpu().numpy())
                 aux_seq['kaug'].append(kaug[idx].cpu().numpy())
-                aux_seq['masks'].append(self.model.masks[idx].cpu().numpy())
+                # aux_seq['masks'].append(self.model.masks[idx].cpu().numpy())
                 aux_seq['is_valid'].append(valid_list[idx])
                 aux_seq['err_valid'].append(error_list[idx])
                 
@@ -609,31 +583,34 @@ class v2s_trainer():
         if opts.local_rank==0:
             log = SummaryWriter('%s/%s'%(opts.checkpoint_dir,opts.logname), comment=opts.logname)
         else: log=None
-        self.model.module.total_steps = 0
-        self.model.module.progress = 0
+        self.model.total_steps = 0
+        self.model.progress = 0
         torch.manual_seed(8)  # do it again
         torch.cuda.manual_seed(1)
 
         # disable bones before warmup epochs are finished
         if opts.lbs: 
             self.model.num_bone_used = 0
-            del self.model.module.nerf_models['bones']
+            del self.model.networks['bones']
         if opts.lbs and opts.nerf_skin:
-            del self.model.module.nerf_models['nerf_skin']
+            del self.model.networks['nerf_skin']
     
         # warmup shape
-        if opts.warmup_shape_ep>0:
-            self.warmup_shape(log)
+        # if opts.warmup_shape_ep>0:
+        #     self.warmup_shape(log)
 
         # CNN pose warmup or  load CNN
-        if opts.warmup_pose_ep>0 or opts.pose_cnn_path!='':
+        # import pdb;pdb.set_trace()
+        if opts.preload_pose:
+            self.preload_pose()
+        elif opts.warmup_pose_ep>0 or opts.pose_cnn_path!='':
             self.warmup_pose(log, pose_cnn_path=opts.pose_cnn_path)
         else:
             # save cameras to latest vars and file
             if opts.use_rtk_file:
-                self.model.module.use_cam=True
+                self.model.use_cam=True
                 self.extract_cams(self.dataloader)
-                self.model.module.use_cam=opts.use_cam
+                self.model.use_cam=opts.use_cam
             else:
                 self.extract_cams(self.dataloader)
 
@@ -642,31 +619,32 @@ class v2s_trainer():
             # set se3 directly
             rmat = torch.Tensor(self.model.latest_vars['rtk'][:,:3,:3])
             quat = transforms.matrix_to_quaternion(rmat).to(self.device)
-            self.model.module.nerf_root_rts.base_rt.se3.data[:,3:] = quat
-
+            self.model.nerf_root_rts.base_rt.se3.data[:,3:] = quat
+            # self.model.nerf_root_rts.base_rt.se3.data[:,:3] = torch.Tensor(self.model.latest_vars['rtk'][:,:3,3]).to(self.device)
+        # import pdb;pdb.set_trace()
         # clear buffers for pytorch1.10+
         try: self.model._assign_modules_buffers()
         except: pass
 
         # set near-far plane
-        if opts.model_path=='':
-            self.reset_nf()
+        # if opts.model_path=='':
+        #     self.reset_nf()
 
         # reset idk in latest_vars
-        self.model.module.latest_vars['idk'][:] = 0.
+        self.model.latest_vars['idk'][:] = 0.
    
         #TODO save loaded wts of posecs
-        if opts.freeze_coarse:
-            self.model.module.shape_xyz_wt = \
-                grab_xyz_weights(self.model.module.nerf_coarse, clone=True)
-            self.model.module.skin_xyz_wt = \
-                grab_xyz_weights(self.model.module.nerf_skin, clone=True)
-            self.model.module.feat_xyz_wt = \
-                grab_xyz_weights(self.model.module.nerf_feat, clone=True)
+        # if opts.freeze_coarse:
+        #     self.model.shape_xyz_wt = \
+        #         grab_xyz_weights(self.model.nerf_coarse, clone=True)
+        #     self.model.skin_xyz_wt = \
+        #         grab_xyz_weights(self.model.nerf_skin, clone=True)
+        #     self.model.feat_xyz_wt = \
+        #         grab_xyz_weights(self.model.nerf_feat, clone=True)
 
         #TODO reset beta
-        if opts.reset_beta:
-            self.model.module.nerf_coarse.beta.data[:] = 0.1
+        # if opts.reset_beta:
+        #     self.model.nerf_coarse.beta.data[:] = 0.1
 
         # start training
         for epoch in range(0, self.num_epochs):
@@ -674,32 +652,52 @@ class v2s_trainer():
 
             # evaluation
             torch.cuda.empty_cache()
-            self.model.module.img_size = opts.render_size
-            rendered_seq, aux_seq = self.eval()                
-            self.model.module.img_size = opts.img_size
-            if epoch==0: self.save_network('0') # to save some cameras
-            if opts.local_rank==0: self.add_image_grid(rendered_seq, log, epoch)
+            # self.model.img_size = opts.render_size
+            # rendered_seq, aux_seq = self.eval()                
+            self.model.img_size = opts.img_size
+            # if epoch==0: self.save_network('0') # to save some cameras
+            # if opts.local_rank==0: self.add_image_grid(rendered_seq, log, epoch)
 
             self.reset_hparams(epoch)
 
             torch.cuda.empty_cache()
             
-            ## TODO harded coded
-            #if opts.freeze_proj:
-            #    if self.model.module.progress<0.8:
-            #        #opts.nsample=64
-            #        opts.ndepth=2
-            #    else:
-            #        #opts.nsample = nsample
-            #        opts.ndepth = self.model.module.ndepth_bk
-
+            # temp_dir = self.save_dir+"/imgs"
+            # if not os.path.isdir(temp_dir):
+            #     os.makedirs(temp_dir)
+            # with torch.no_grad():
+            #     self.model.save_imgs(temp_dir,epoch,5,use_deform=False,novel_cam=True,save_img=False)
+            # import pdb;pdb.set_trace()
+            
             self.train_one_epoch(epoch, log)
             
-            print('saving the model at the end of epoch {:d}, iters {:d}'.\
-                              format(epoch, self.model.module.total_steps))
-            self.save_network('latest')
-            self.save_network(str(epoch+1))
-
+            
+            target_vid = 0
+            # if epoch % 6 == 5:
+            temp_dir = self.save_dir+"/imgs"
+            if not os.path.isdir(temp_dir):
+                os.makedirs(temp_dir)
+            with torch.no_grad():
+                if epoch % 3 == 0:
+                    self.model.save_imgs(temp_dir,epoch,target_vid,save_img=False)
+                    self.model.save_imgs(temp_dir,epoch,target_vid,use_deform=False,novel_cam=True,save_img=False)
+                    self.model.save_imgs(temp_dir,epoch,target_vid,fixed_cam=True,save_img=False)
+                    self.save_cameras(self.model.rtk_all,epoch,target_vid)
+            temp_dir = self.save_dir+"/checkpoints"
+            if not os.path.isdir(temp_dir):
+                os.makedirs(temp_dir)
+            if epoch % 20 == 1:
+                self.model.gaussians.save_ply(temp_dir+'/epoch_'+str(epoch)+'.ply')
+                
+    def save_cameras(self, rtk_all, epoch, vid=5):
+        temp_dir = self.save_dir+"/cam"
+        if not os.path.isdir(temp_dir):
+            os.makedirs(temp_dir)
+        rtks = rtk_all[self.model.data_offset[vid]:self.model.data_offset[vid+1]]
+        rtks = torch.cat([rtks,self.model.ks_param[vid][None,None,...].repeat(rtks.shape[0],1,1)],dim=1).detach().cpu()
+        mesh_cam = draw_cams(rtks)
+        mesh_cam.export('%s/mesh_cam-%03d.obj'%(temp_dir,epoch))
+        
     @staticmethod
     def save_cams(opts,aux_seq, save_prefix, latest_vars,datasets, evalsets, obj_scale,
             trainloader=None, unc_filter=True):
@@ -736,6 +734,7 @@ class v2s_trainer():
             rtklist = dataset_dict[seqname].rtklist
             idx = int(impath.split('/')[-1].split('.')[-2])
             save_path = '%s/%s-%05d.txt'%(save_prefix, seqname, idx)
+            # import pdb;pdb.set_trace()
             np.savetxt(save_path, rtk)
             rtklist[idx] = save_path
             evalset_dict[seqname].rtklist[idx] = save_path
@@ -780,13 +779,13 @@ class v2s_trainer():
         save_prefix = '%s/init-cam'%(self.save_dir)
         trainloader=self.trainloader.dataset.datasets
         self.save_cams(opts,aux_seq, save_prefix,
-                    self.model.module.latest_vars,
+                    self.model.latest_vars,
                     full_loader.dataset.datasets,
                 self.evalloader.dataset.datasets,
                 self.model.obj_scale, trainloader=trainloader,
                 unc_filter=opts.unc_filter)
         
-        dist.barrier() # wait untail all have finished
+        # dist.barrier() # wait untail all have finished
         if opts.local_rank==0:
             # draw camera trajectory
             for dataset in full_loader.dataset.datasets:
@@ -802,7 +801,7 @@ class v2s_trainer():
         # save object bound if first stage
         if opts.model_path=='' and opts.bound_factor>0:
             shape_verts = shape_verts*opts.bound_factor
-            self.model.module.latest_vars['obj_bound'] = \
+            self.model.latest_vars['obj_bound'] = \
             shape_verts.abs().max(0)[0].detach().cpu().numpy()
 
         if self.model.near_far[:,0].sum()==0: # if no valid nf plane loaded
@@ -817,7 +816,7 @@ class v2s_trainer():
         opts = self.opts
 
         # force using warmup forward, dataloader, cnn root
-        self.model.module.forward = self.model.module.forward_warmup_shape
+        self.model.forward = self.model.forward_warmup_shape
         full_loader = self.trainloader  # store original loader
         self.trainloader = range(200)
         self.num_epochs = opts.warmup_shape_ep
@@ -830,29 +829,39 @@ class v2s_trainer():
             self.save_network(str(epoch+1), 'mlp-') 
 
         # restore dataloader, rts, forward function
-        self.model.module.forward = self.model.module.forward_default
+        self.model.forward = self.model.forward_default
         self.trainloader = full_loader
         self.num_epochs = opts.num_epochs
 
         # start from low learning rate again
         self.init_training()
-        self.model.module.total_steps = 0
-        self.model.module.progress = 0.
+        self.model.total_steps = 0
+        self.model.progress = 0.
 
+    def preload_pose(self):
+        print('Preloading estimated cameras...')
+        load_prefix = '%s/init-cam'%(self.save_dir)
+        for i in tqdm(range(self.model.latest_vars['rtk'].shape[0])):
+            impath = self.model.impath[i]
+            idx = int(impath.split('/')[-1].split('.')[-2])
+            seqname = impath.split('/')[-2]
+            load_path = '%s/%s-%05d.txt'%(load_prefix, seqname, idx)
+            self.model.latest_vars['rtk'][i] = (np.loadtxt(load_path))
+            
     def warmup_pose(self, log, pose_cnn_path):
         opts = self.opts
 
         # force using warmup forward, dataloader, cnn root
-        self.model.module.root_basis = 'cnn'
-        self.model.module.use_cam = False
-        self.model.module.forward = self.model.module.forward_warmup
+        self.model.root_basis = 'cnn'
+        self.model.use_cam = False
+        self.model.forward = self.model.forward_warmup
         full_loader = self.dataloader  # store original loader
         self.dataloader = range(200)
-        original_rp = self.model.module.nerf_root_rts
-        self.model.module.nerf_root_rts = self.model.module.dp_root_rts
-        del self.model.module.dp_root_rts
+        original_rp = self.model.nerf_root_rts
+        self.model.nerf_root_rts = self.model.dp_root_rts
+        del self.model.dp_root_rts
         self.num_epochs = opts.warmup_pose_ep
-        self.model.module.is_warmup_pose=True
+        self.model.is_warmup_pose=True
 
         if pose_cnn_path=='':
             # training
@@ -870,110 +879,106 @@ class v2s_trainer():
             pose_states = torch.load(opts.pose_cnn_path, map_location='cpu')
             pose_states = self.rm_module_prefix(pose_states, 
                     prefix='module.nerf_root_rts')
-            self.model.module.nerf_root_rts.load_state_dict(pose_states, 
+            self.model.nerf_root_rts.load_state_dict(pose_states, 
                                                         strict=False)
 
         # extract camera and near far planes
         self.extract_cams(full_loader)
-
+        # import pdb;pdb.set_trace()
         # restore dataloader, rts, forward function
-        self.model.module.root_basis=opts.root_basis
-        self.model.module.use_cam = opts.use_cam
-        self.model.module.forward = self.model.module.forward_default
+        self.model.root_basis=opts.root_basis
+        self.model.use_cam = opts.use_cam
+        self.model.forward = self.model.forward_default
         self.dataloader = full_loader
-        del self.model.module.nerf_root_rts
-        self.model.module.nerf_root_rts = original_rp
+        del self.model.nerf_root_rts
+        self.model.nerf_root_rts = original_rp
         self.num_epochs = opts.num_epochs
-        self.model.module.is_warmup_pose=False
+        self.model.is_warmup_pose=False
 
         # start from low learning rate again
         self.init_training()
-        self.model.module.total_steps = 0
-        self.model.module.progress = 0.
+        self.model.total_steps = 0
+        self.model.progress = 0.
             
     def train_one_epoch(self, epoch, log, warmup=False):
         """
         training loop in a epoch
         """
         opts = self.opts
-        self.model.train()
+        # self.model.train()
         dataloader = self.trainloader
-    
-        if not warmup: dataloader.sampler.set_epoch(epoch) # necessary for shuffling
-        for i, batch in enumerate(dataloader):
-            if i==200*opts.accu_steps:
-                break
+        print(f'start training epoch {epoch}')
+        # if not warmup: dataloader.sampler.set_epoch(epoch) # necessary for shuffling
+        for i, batch in tqdm(enumerate(dataloader)):
+            # if i==200*opts.accu_steps:
+            #     break
+            # if i>1:break
+            opt = self.model.optim
+            gaussians = self.model.gaussians
+            self.model.total_steps += 1
+            iteration = self.model.total_steps
             
-            if opts.debug:
-                if 'start_time' in locals().keys():
-                    torch.cuda.synchronize()
-                    print('load time:%.2f'%(time.time()-start_time))
+            gaussians.update_learning_rate(iteration)
 
+            # Every 1000 its we increase the levels of SH up to a maximum degree
+            if iteration % 1000 == 1:
+                gaussians.oneupSHdegree()
+            
             if not warmup:
-                self.model.module.progress = float(self.model.total_steps) /\
+                self.model.progress = float(self.model.total_steps) /\
                                                self.model.final_steps
-                self.select_loss_indicator(i)
                 self.update_root_indicator(i)
                 self.update_body_indicator(i)
                 self.update_shape_indicator(i)
-                self.update_cvf_indicator(i)
 
-#                rtk_all = self.model.module.compute_rts()
-#                self.model.module.rtk_all = rtk_all.clone()
-#
-#            # change near-far plane for all views
-#            if self.model.module.progress>=opts.nf_reset:
-#                rtk_all = rtk_all.detach().cpu().numpy()
-#                valid_rts = self.model.module.latest_vars['idk'].astype(bool)
-#                self.model.module.latest_vars['rtk'][valid_rts,:3] = rtk_all[valid_rts]
-#                self.model.module.near_far.data = get_near_far(
-#                                              self.model.module.near_far.data,
-#                                              self.model.module.latest_vars)
-#
+
 #            self.optimizer.zero_grad()
             total_loss,aux_out = self.model(batch)
             total_loss = total_loss/self.accu_steps
-
-            if opts.debug:
-                if 'start_time' in locals().keys():
-                    torch.cuda.synchronize()
-                    print('forward time:%.2f'%(time.time()-start_time))
-
             total_loss.mean().backward()
+            # import pdb;pdb.set_trace()
             
-            if opts.debug:
-                if 'start_time' in locals().keys():
-                    torch.cuda.synchronize()
-                    print('forward back time:%.2f'%(time.time()-start_time))
+            image, viewspace_point_tensor, visibility_filter, radii = aux_out["render"], aux_out["viewspace_points"], aux_out["visibility_filter"], aux_out["radii"]
+            with torch.no_grad():
+                if (self.model.total_steps)%self.accu_steps == 0:
+                    self.clip_grad(aux_out)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad()
+                if iteration < opt.densify_until_iter:
+                    # Keep track of max radii in image-space for pruning
+                    gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-            if (i+1)%self.accu_steps == 0:
-                self.clip_grad(aux_out)
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
+                    if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        op_threshold = 0.01 if iteration==opt.densify_from_iter+opt.densification_interval else 0.01
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, op_threshold, self.model.bound*1.4, size_threshold)
+                    
+                    if iteration % opt.opacity_reset_interval == 0 or (iteration == opt.densify_from_iter):
+                        gaussians.reset_opacity()
+                
 
-                if aux_out['nerf_root_rts_g']>1*opts.clip_scale and \
-                                self.model.total_steps>200*self.accu_steps:
-                    latest_path = '%s/params_latest.pth'%(self.save_dir)
-                    self.load_network(latest_path, is_eval=False, rm_prefix=False)
+                # if aux_out['nerf_root_rts_g']>1*opts.clip_scale and \
+                #                 self.model.total_steps>200*self.accu_steps:
+                #     latest_path = '%s/params_latest.pth'%(self.save_dir)
+                #     self.load_network(latest_path, is_eval=False, rm_prefix=False)
                 
             for i,param_group in enumerate(self.optimizer.param_groups):
                 aux_out['lr_%02d'%i] = param_group['lr']
 
-            self.model.module.total_steps += 1
-            self.model.module.counter_frz_rebone -= 1./self.model.final_steps
-            aux_out['counter_frz_rebone'] = self.model.module.counter_frz_rebone
-
-            if opts.local_rank==0: 
-                self.save_logs(log, aux_out, self.model.module.total_steps, 
-                        epoch)
             
-            if opts.debug:
-                if 'start_time' in locals().keys():
-                    torch.cuda.synchronize()
-                    print('total step time:%.2f'%(time.time()-start_time))
-                torch.cuda.synchronize()
-                start_time = time.time()
+            self.model.counter_frz_rebone -= 1./self.model.final_steps
+            aux_out['counter_frz_rebone'] = self.model.counter_frz_rebone
+            
+            for item in aux_out.keys():
+                if item[-5:] == '_loss':
+                    self.writer.add_scalar('train_loss/'+item,aux_out[item],iteration)
+            self.writer.add_scalar('train_gaussian/number',self.model.gaussians._xyz.shape[0],iteration)
+
+            
+            
     
     def update_cvf_indicator(self, i):
         """
@@ -984,18 +989,18 @@ class v2s_trainer():
         opts = self.opts
 
         # during kp reprojection optimization
-        if (opts.freeze_proj and self.model.module.progress >= opts.proj_start and \
-               self.model.module.progress < (opts.proj_start+opts.proj_end)):
-            self.model.module.cvf_update = 1
+        if (opts.freeze_proj and self.model.progress >= opts.proj_start and \
+               self.model.progress < (opts.proj_start+opts.proj_end)):
+            self.model.cvf_update = 1
         else:
-            self.model.module.cvf_update = 0
+            self.model.cvf_update = 0
         
         # freeze shape after rebone        
-        if self.model.module.counter_frz_rebone > 0:
-            self.model.module.cvf_update = 1
+        if self.model.counter_frz_rebone > 0:
+            self.model.cvf_update = 1
 
         if opts.freeze_cvf:
-            self.model.module.cvf_update = 1
+            self.model.cvf_update = 1
     
     def update_shape_indicator(self, i):
         """
@@ -1007,19 +1012,19 @@ class v2s_trainer():
         # incremental optimization
         # or during kp reprojection optimization
         if (opts.model_path!='' and \
-        self.model.module.progress < opts.warmup_steps)\
-         or (opts.freeze_proj and self.model.module.progress >= opts.proj_start and \
-               self.model.module.progress <(opts.proj_start + opts.proj_end)):
-            self.model.module.shape_update = 1
+        self.model.progress < opts.warmup_steps)\
+         or (opts.freeze_proj and self.model.progress >= opts.proj_start and \
+               self.model.progress <(opts.proj_start + opts.proj_end)):
+            self.model.shape_update = 1
         else:
-            self.model.module.shape_update = 0
+            self.model.shape_update = 0
 
         # freeze shape after rebone        
-        if self.model.module.counter_frz_rebone > 0:
-            self.model.module.shape_update = 1
+        if self.model.counter_frz_rebone > 0:
+            self.model.shape_update = 1
 
         if opts.freeze_shape:
-            self.model.module.shape_update = 1
+            self.model.shape_update = 1
     
     def update_root_indicator(self, i):
         """
@@ -1030,19 +1035,19 @@ class v2s_trainer():
         opts = self.opts
         if (opts.freeze_proj and \
             opts.root_stab and \
-           self.model.module.progress >=(opts.frzroot_start) and \
-           self.model.module.progress <=(opts.proj_start + opts.proj_end+0.01))\
+           self.model.progress >=(opts.frzroot_start) and \
+           self.model.progress <=(opts.proj_start + opts.proj_end+0.01))\
            : # to stablize
-            self.model.module.root_update = 0
+            self.model.root_update = 0
         else:
-            self.model.module.root_update = 1
+            self.model.root_update = 1
         
         # freeze shape after rebone        
-        if self.model.module.counter_frz_rebone > 0:
-            self.model.module.root_update = 0
+        if self.model.counter_frz_rebone > 0:
+            self.model.root_update = 0
         
         if opts.freeze_root: # to stablize
-            self.model.module.root_update = 0
+            self.model.root_update = 0
     
     def update_body_indicator(self, i):
         """
@@ -1052,10 +1057,10 @@ class v2s_trainer():
         """
         opts = self.opts
         if opts.freeze_proj and \
-           self.model.module.progress <=opts.frzbody_end: 
-            self.model.module.body_update = 0
+           self.model.progress <=opts.frzbody_end: 
+            self.model.body_update = 0
         else:
-            self.model.module.body_update = 1
+            self.model.body_update = 1
 
         
     def select_loss_indicator(self, i):
@@ -1065,14 +1070,14 @@ class v2s_trainer():
         """
         opts = self.opts
         if not opts.root_opt or \
-            self.model.module.progress > (opts.warmup_steps):
-            self.model.module.loss_select = 1
+            self.model.progress > (opts.warmup_steps):
+            self.model.loss_select = 1
         elif i%2 == 0:
-            self.model.module.loss_select = 0
+            self.model.loss_select = 0
         else:
-            self.model.module.loss_select = 1
+            self.model.loss_select = 1
 
-        #self.model.module.loss_select=1
+        #self.model.loss_select=1
         
 
     def reset_hparams(self, epoch):
@@ -1080,40 +1085,40 @@ class v2s_trainer():
         reset hyper-parameters based on current geometry / cameras
         """
         opts = self.opts
-        mesh_rest = self.model.latest_vars['mesh_rest']
+        # mesh_rest = self.model.latest_vars['mesh_rest']
 
         # reset object bound, for feature matching
-        if epoch>int(self.num_epochs*(opts.bound_reset)):
-            if mesh_rest.vertices.shape[0]>100:
-                self.model.latest_vars['obj_bound'] = 1.2*np.abs(mesh_rest.vertices).max(0)
+        # if epoch>int(self.num_epochs*(opts.bound_reset)):
+        #     if mesh_rest.vertices.shape[0]>100:
+        #         self.model.latest_vars['obj_bound'] = 1.2*np.abs(mesh_rest.vertices).max(0)
         
         # reinit bones based on extracted surface
         # only reinit for the initialization phase
         if opts.lbs and opts.model_path=='' and \
-                        (epoch==int(self.num_epochs*opts.reinit_bone_steps) or\
+                        (((epoch%6==0)and(epoch<=self.num_epochs/2)) or\
                          epoch==0 or\
                          epoch==int(self.num_epochs*opts.warmup_steps)//2):
-            reinit_bones(self.model.module, mesh_rest, opts.num_bones)
+            reinit_bones(self.model, self.model.gaussians.get_xyz, opts.num_bones)
             self.init_training() # add new params to optimizer
             if epoch>0:
                 # freeze weights of root pose in the following 1% iters
-                self.model.module.counter_frz_rebone = 0.01
-                #reset error stats
-                self.model.module.latest_vars['fp_err']      [:]=0
-                self.model.module.latest_vars['flo_err']     [:]=0
-                self.model.module.latest_vars['sil_err']     [:]=0
-                self.model.module.latest_vars['flo_err_hist'][:]=0
+                self.model.counter_frz_rebone = 0.01
+            #     #reset error stats
+            #     self.model.latest_vars['fp_err']      [:]=0
+            #     self.model.latest_vars['flo_err']     [:]=0
+            #     self.model.latest_vars['sil_err']     [:]=0
+            #     self.model.latest_vars['flo_err_hist'][:]=0
 
         # need to add bones back at 2nd opt
         if opts.model_path!='':
-            self.model.module.nerf_models['bones'] = self.model.module.bones
+            self.model.networks['bones'] = self.model.bones
 
         # add nerf-skin when the shape is good
         if opts.lbs and opts.nerf_skin and \
                 epoch==int(self.num_epochs*opts.dskin_steps):
-            self.model.module.nerf_models['nerf_skin'] = self.model.module.nerf_skin
+            self.model.networks['nerf_skin'] = self.model.nerf_skin
 
-        self.broadcast()
+        # self.broadcast()
 
     def broadcast(self):
         """
@@ -1122,29 +1127,21 @@ class v2s_trainer():
         dist.barrier()
         if self.opts.lbs:
             dist.broadcast_object_list(
-                    [self.model.module.num_bones, 
-                    self.model.module.num_bone_used,],
+                    [self.model.num_bones, 
+                    self.model.num_bone_used,],
                     0)
-            dist.broadcast(self.model.module.bones,0)
-            dist.broadcast(self.model.module.nerf_body_rts[1].rgb[0].weight, 0)
-            dist.broadcast(self.model.module.nerf_body_rts[1].rgb[0].bias, 0)
+            dist.broadcast(self.model.bones,0)
+            dist.broadcast(self.model.nerf_body_rts[1].rgb[0].weight, 0)
+            dist.broadcast(self.model.nerf_body_rts[1].rgb[0].bias, 0)
 
-        dist.broadcast(self.model.module.near_far,0)
+        dist.broadcast(self.model.near_far,0)
    
     def clip_grad(self, aux_out):
         """
         gradient clipping
         """
         is_invalid_grad=False
-        grad_nerf_coarse=[]
-        grad_nerf_beta=[]
-        grad_nerf_feat=[]
-        grad_nerf_beta_feat=[]
-        grad_nerf_fine=[]
-        grad_nerf_unc=[]
-        grad_nerf_flowbw=[]
         grad_nerf_skin=[]
-        grad_nerf_vis=[]
         grad_nerf_root_rts=[]
         grad_nerf_body_rts=[]
         grad_root_code=[]
@@ -1163,24 +1160,9 @@ class v2s_trainer():
                     print(name)
                     is_invalid_grad=True
             except: pass
-            if 'nerf_coarse' in name and 'beta' not in name:
-                grad_nerf_coarse.append(p)
-            elif 'nerf_coarse' in name and 'beta' in name:
-                grad_nerf_beta.append(p)
-            elif 'nerf_feat' in name and 'beta' not in name:
-                grad_nerf_feat.append(p)
-            elif 'nerf_feat' in name and 'beta' in name:
-                grad_nerf_beta_feat.append(p)
-            elif 'nerf_fine' in name:
-                grad_nerf_fine.append(p)
-            elif 'nerf_unc' in name:
-                grad_nerf_unc.append(p)
-            elif 'nerf_flowbw' in name or 'nerf_flowfw' in name:
-                grad_nerf_flowbw.append(p)
-            elif 'nerf_skin' in name:
+            
+            if 'nerf_skin' in name:
                 grad_nerf_skin.append(p)
-            elif 'nerf_vis' in name:
-                grad_nerf_vis.append(p)
             elif 'nerf_root_rts' in name:
                 grad_nerf_root_rts.append(p)
             elif 'nerf_body_rts' in name:
@@ -1204,66 +1186,30 @@ class v2s_trainer():
             elif 'csenet' in name:
                 grad_csenet.append(p)
             else: continue
-        
+        # import pdb;pdb.set_trace()
         # freeze root pose when using re-projection loss only
-        if self.model.module.root_update == 0:
+        if self.model.root_update == 0:
             self.zero_grad_list(grad_root_code)
             self.zero_grad_list(grad_nerf_root_rts)
-        if self.model.module.body_update == 0:
+        if self.model.body_update == 0:
             self.zero_grad_list(grad_pose_code)
             self.zero_grad_list(grad_nerf_body_rts)
         if self.opts.freeze_body_mlp:
             self.zero_grad_list(grad_nerf_body_rts)
-        if self.model.module.shape_update == 1:
-            self.zero_grad_list(grad_nerf_coarse)
-            self.zero_grad_list(grad_nerf_beta)
-            self.zero_grad_list(grad_nerf_vis)
+        if self.model.shape_update == 1:
             #TODO add skinning 
             self.zero_grad_list(grad_bones)
             self.zero_grad_list(grad_nerf_skin)
             self.zero_grad_list(grad_skin_aux)
-        if self.model.module.cvf_update == 1:
-            self.zero_grad_list(grad_nerf_feat)
-            self.zero_grad_list(grad_nerf_beta_feat)
+        if self.model.cvf_update == 1:
             self.zero_grad_list(grad_csenet)
         if self.opts.freeze_coarse:
-            # freeze shape
-            # this include nerf_coarse, nerf_skin (optional)
-            grad_coarse_mlp = []
-            grad_coarse_mlp += self.find_nerf_coarse(\
-                                self.model.module.nerf_coarse)
-            grad_coarse_mlp += self.find_nerf_coarse(\
-                                self.model.module.nerf_skin)
-            grad_coarse_mlp += self.find_nerf_coarse(\
-                                self.model.module.nerf_feat)
-            self.zero_grad_list(grad_coarse_mlp)
-
-            #self.zero_grad_list(grad_nerf_coarse) # freeze shape
-
-            # freeze skinning 
-            self.zero_grad_list(grad_bones)
-            self.zero_grad_list(grad_skin_aux)
-            #self.zero_grad_list(grad_nerf_skin) # freeze fine shape
-
-            ## freeze pose mlp
-            #self.zero_grad_list(grad_nerf_body_rts)
-
-            # add vis
-            self.zero_grad_list(grad_nerf_vis)
-            #print(self.model.module.nerf_coarse.xyz_encoding_1[0].weight[0,:])
+            pass
            
         clip_scale=self.opts.clip_scale
  
         #TODO don't clip root pose
-        aux_out['nerf_coarse_g']   = clip_grad_norm_(grad_nerf_coarse,    1*clip_scale)
-        aux_out['nerf_beta_g']     = clip_grad_norm_(grad_nerf_beta,      1*clip_scale)
-        aux_out['nerf_feat_g']     = clip_grad_norm_(grad_nerf_feat,     .1*clip_scale)
-        aux_out['nerf_beta_feat_g']= clip_grad_norm_(grad_nerf_beta_feat,.1*clip_scale)
-        aux_out['nerf_fine_g']     = clip_grad_norm_(grad_nerf_fine,     .1*clip_scale)
-        aux_out['nerf_unc_g']     = clip_grad_norm_(grad_nerf_unc,       .1*clip_scale)
-        aux_out['nerf_flowbw_g']   = clip_grad_norm_(grad_nerf_flowbw,   .1*clip_scale)
         aux_out['nerf_skin_g']     = clip_grad_norm_(grad_nerf_skin,     .1*clip_scale)
-        aux_out['nerf_vis_g']      = clip_grad_norm_(grad_nerf_vis,      .1*clip_scale)
         aux_out['nerf_root_rts_g'] = clip_grad_norm_(grad_nerf_root_rts,100*clip_scale)
         aux_out['nerf_body_rts_g'] = clip_grad_norm_(grad_nerf_body_rts,100*clip_scale)
         aux_out['root_code_g']= clip_grad_norm_(grad_root_code,          .1*clip_scale)
@@ -1278,8 +1224,8 @@ class v2s_trainer():
 
         #if aux_out['nerf_root_rts_g']>10:
         #    is_invalid_grad = True
-        if is_invalid_grad:
-            self.zero_grad_list(self.model.parameters())
+        # if is_invalid_grad:
+        #     self.zero_grad_list(self.model.parameters())
             
     @staticmethod
     def find_nerf_coarse(nerf_model):

@@ -19,23 +19,15 @@ opts = flags.FLAGS
 
 def main(_):
     torch.cuda.set_device(opts.local_rank)
-    world_size = opts.ngpu
-    torch.distributed.init_process_group(
-    'nccl',
-    init_method='env://',
-    world_size=world_size,
-    rank=opts.local_rank,
-    )
-    print('%d/%d'%(world_size,opts.local_rank))
-
     torch.manual_seed(0)
     torch.cuda.manual_seed(1)
     torch.manual_seed(0)
     
     trainer = v2s_trainer(opts)
     data_info = trainer.init_dataset()    
-    trainer.define_model(data_info)
+    trainer.define_model(data_info) 
     trainer.init_training()
+    # import pdb;pdb.set_trace()
     trainer.train()
 
 if __name__ == '__main__':

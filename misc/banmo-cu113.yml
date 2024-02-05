@@ -119,7 +119,7 @@ dependencies:
     - protobuf==3.19.4
     - pyasn1==0.4.8
     - pyasn1-modules==0.2.8
-    - pycocotools==2.0.4
+    # - pycocotools==2.0.4
     - pydot==1.4.2
     - pyglet==1.5.21
     - pykeops==1.5

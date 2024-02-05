@@ -54,8 +54,9 @@ class BaseDataset(Dataset):
         self.filter_key = filter_key
         self.flip=0
         self.crop_factor = 1.2
-        self.load_pair = True
+        self.load_pair = False
         self.spec_dt = 0 # whether to specify the dframe, only in preload
+        self.feat_only = False
     
     def mirror_image(self, img, mask):
         if np.random.rand(1) > 0.5:
@@ -70,7 +71,7 @@ class BaseDataset(Dataset):
     def __len__(self):
         return self.num_imgs
     
-    def read_raw(self, im0idx, flowfw,dframe):
+    def read_raw(self, im0idx, flowfw, dframe):
         #ss = time.time()
         img_path = self.imglist[im0idx]
         img = cv2.imread(img_path)[:,:,::-1] / 255.0
@@ -153,21 +154,22 @@ class BaseDataset(Dataset):
         #print('rtk:%f'%(time.time()-ss))
         
         # crop the image according to mask
-        kaug, hp0, A, B= self.compute_crop_params(mask)
+        kaug, hp0, A, B= self.compute_crop_params(np.ones_like(mask))
         #print('crop params:%f'%(time.time()-ss))
         x0 = hp0[:,:,0].astype(np.float32)
         y0 = hp0[:,:,1].astype(np.float32)
-        img = cv2.remap(img,x0,y0,interpolation=cv2.INTER_LINEAR)
-        mask = cv2.remap(mask.astype(int),x0,y0,interpolation=cv2.INTER_NEAREST)
-        flow = cv2.remap(flow,x0,y0,interpolation=cv2.INTER_LINEAR)
-        occ = cv2.remap(occ,x0,y0,interpolation=cv2.INTER_LINEAR)
-        dp   =cv2.remap(dp,   x0,y0,interpolation=cv2.INTER_NEAREST)
-        vis2d=cv2.remap(vis2d.astype(int),x0,y0,interpolation=cv2.INTER_NEAREST)
+        # img = cv2.remap(img,x0,y0,interpolation=cv2.INTER_LINEAR)
+        # mask = cv2.remap(mask.astype(int),x0,y0,interpolation=cv2.INTER_NEAREST)
+        # flow = cv2.remap(flow,x0,y0,interpolation=cv2.INTER_LINEAR)
+        # occ = cv2.remap(occ,x0,y0,interpolation=cv2.INTER_LINEAR)
+        # vis2d=cv2.remap(vis2d.astype(int),x0,y0,interpolation=cv2.INTER_NEAREST)
+        # dp   =cv2.remap(dp,   x0,y0,interpolation=cv2.INTER_NEAREST)
         
         #print('crop:%f'%(time.time()-ss))
 
         # Finally transpose the image to 3xHxW
         img = np.transpose(img, (2, 0, 1))
+        
         mask = (mask>0).astype(float)
         
         #TODO transform dp feat to same size as img
@@ -199,9 +201,9 @@ class BaseDataset(Dataset):
         
         #print('center:%f'%(time.time()-ss))
 
-        maxw=self.img_size;maxh=self.img_size
+        maxw=mask.shape[1];maxh=mask.shape[0]
         orisize = (2*length[0], 2*length[1])
-        alp =  [orisize[0]/maxw  ,orisize[1]/maxw]
+        alp =  [orisize[0]/maxw  ,orisize[1]/maxh]
         
         # intrinsics induced by augmentation: augmented to to original img
         # correct cx,cy at clip space (not tx, ty)
@@ -221,7 +223,7 @@ class BaseDataset(Dataset):
         return kaug, hp0, A,B
 
     def flow_process(self,flow, flown, occ, occn, hp0, hp1, A,B,Ap,Bp):
-        maxw=self.img_size;maxh=self.img_size
+        maxw=flow.shape[1];maxh=flow.shape[0]
         # augmenta flow
         hp1c = np.concatenate([flow[:,:,:2] + hp0[:,:,:2], np.ones_like(hp0[:,:,:1])],-1) # image coord
         hp1c = hp1c.dot(np.linalg.inv(Ap.dot(Bp)))   # screen coord
@@ -322,15 +324,15 @@ class BaseDataset(Dataset):
 
             #print('before process:%f'%(time.time()-ss))
        
-            flow, flown, occ, occn = self.flow_process(flow, flown, occ, occn,
-                                        hp0, hp1, A,B,Ap,Bp)
+            # flow, flown, occ, occn = self.flow_process(flow, flown, occ, occn,
+            #                             hp0, hp1, A,B,Ap,Bp)
             #print('after process:%f'%(time.time()-ss))
             
             # stack data
             img = np.stack([img, imgn])
             mask= np.stack([mask,maskn])
-            flow= np.stack([flow, flown])
-            occ = np.stack([occ, occn])
+            # flow= np.stack([flow, flown])
+            # occ = np.stack([occ, occn])
             dp  = np.stack([dp, dpn])
             vis2d= np.stack([vis2d, vis2dn])
             dp_feat= np.stack([dp_feat, dp_featn])
@@ -343,15 +345,16 @@ class BaseDataset(Dataset):
             is_canonical= np.stack([is_canonical, is_canonicaln])
 
         elem = {}
-        elem['img']           =  img        # s
-        elem['mask']          =  mask       # s
-        elem['flow']          =  flow       # s
-        elem['occ']           =  occ        # s 
-        elem['dp']            =  dp         # x
+        if not self.feat_only:
+            elem['img']           =  img        # s
+            elem['mask']          =  mask       # s
+            elem['flow']          =  []# flow       # s
+            elem['occ']           =  []# occ        # s 
+            elem['vis2d']         =  vis2d      # y
+            elem['dp']            =  dp         # x
         elem['dp_feat']       =  dp_feat    # y
         elem['dp_feat_rsmp']  =  dp_feat_rsmp    # y
         elem['dp_bbox']       =  dp_bbox    
-        elem['vis2d']         =  vis2d      # y
         elem['rtk']           =  rtk
         elem['kaug']          =  kaug
         elem['dataid']        =  dataid

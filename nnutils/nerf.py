@@ -9,7 +9,7 @@ import torchvision
 from pytorch3d import transforms
 import trimesh
 from nnutils.geom_utils import fid_reindex
-
+from collections import OrderedDict
 class Embedding(nn.Module):
     def __init__(self, in_channels, N_freqs, logscale=True, alpha=None):
         """
@@ -75,7 +75,33 @@ class Embedding(nn.Module):
         return out
 
 
-
+class MLP(nn.Module):
+    def __init__(self, code_dim, pose_dim, output_dim, D=4, W=128):
+        super(MLP, self).__init__()
+        self.code_dim = code_dim
+        self.pose_dim = pose_dim
+        self.output_dim = output_dim
+        self.input_dim = code_dim+pose_dim
+        self.net = OrderedDict()
+        for i in range(D):
+            if i==0:
+                self.net['Linear_'+str(i)] = (nn.Linear(self.input_dim,W))
+                self.net['ReLU_'+str(i)] = (nn.ReLU(True))
+            elif i==D-1:
+                self.net['Linear_'+str(i)] = (nn.Linear(W, self.output_dim))
+            else:
+                self.net['Linear_'+str(i)] = (nn.Linear(W,W))
+                self.net['ReLU_'+str(i)] = (nn.ReLU(True))
+        self.net = nn.Sequential(self.net)
+        
+    def forward(self, code:torch.Tensor, pose:torch.Tensor):
+        # code: (N, code_dim)
+        # pose: (1, 6*num_bones)
+        input = torch.cat([code,pose.repeat(code.shape[0],1)],dim=-1)
+        output = self.net(input)
+        return output
+        
+        
 class NeRF(nn.Module):
     def __init__(self,
                  D=8, W=256,
@@ -242,6 +268,7 @@ class RTHead(NeRF):
 
     def forward(self, x):
         # output: NxBx(9 rotation + 3 translation)
+        # import pdb;pdb.set_trace()
         x = super(RTHead, self).forward(x)
         bs = x.shape[0]
         rts = x.view(-1,self.num_output)  # bs B,x

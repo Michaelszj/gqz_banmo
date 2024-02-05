@@ -35,19 +35,21 @@ def data_loader(opts_dict, shuffle=True):
     print('# workers: %d'%num_workers)
     print('# pairs: %d'%opts_dict['batch_size'])
 
-    data_inuse = config_to_dataloader(opts_dict)
+    data_inuse = config_to_dataloader(opts_dict,is_eval=True)
 
-    sampler = torch.utils.data.distributed.DistributedSampler(
-    data_inuse,
-    num_replicas=opts_dict['ngpu'],
-    rank=opts_dict['local_rank'],
-    shuffle=True
-    )
+    # sampler = torch.utils.data.distributed.DistributedSampler(
+    # data_inuse,
+    # num_replicas=opts_dict['ngpu'],
+    # rank=opts_dict['local_rank'],
+    # shuffle=True
+    # )
 
+    # data_inuse = DataLoader(data_inuse,
+    #      batch_size= opts_dict['batch_size'], num_workers=num_workers, 
+    #      drop_last=True, worker_init_fn=_init_fn, pin_memory=True,
+    #      sampler=sampler)
     data_inuse = DataLoader(data_inuse,
-         batch_size= opts_dict['batch_size'], num_workers=num_workers, 
-         drop_last=True, worker_init_fn=_init_fn, pin_memory=True,
-         sampler=sampler)
+         batch_size= 1, num_workers=num_workers, drop_last=False, pin_memory=True, shuffle=shuffle)
     return data_inuse
 
 #----------- Eval Data Loader ----------#
