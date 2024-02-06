@@ -185,7 +185,7 @@ class GaussianModel:
     def random_init(self):
         bound = self.bound
         base_point_num = 100000
-        fused_point_cloud = (torch.rand((base_point_num,3))*bound*2-bound).float().cuda()
+        fused_point_cloud = (torch.randn((base_point_num,3))*bound).float().cuda()
         fused_color = RGB2SH(torch.rand((base_point_num,3)).float().cuda())
         # fused_color = RGB2SH(fused_point_cloud.detach()/2.+0.5)
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()

@@ -220,7 +220,7 @@ class banmo(nn.Module):
         self.latest_vars['flo_err_hist'] = np.zeros((self.data_offset[-1],6,10))
 
         
-        self.bound = .2
+        self.bound = .05
         self.obj_scale = 10.
         # set shape/appearancce model
         self.num_freqs = 10
@@ -1391,7 +1391,7 @@ class banmo(nn.Module):
             Rmat = rtk[:3,:3]
             Tmat = rtk[:3,3]
             K = rtk[3,:]
-            cam_r = 1.
+            cam_r = 0.5
             if fixed_cam:
                 angle = 0.
                 Rmat = torch.inverse(torch.tensor([[np.sin(angle),0.,np.cos(angle)],

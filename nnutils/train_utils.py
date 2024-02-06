@@ -953,7 +953,7 @@ class v2s_trainer():
 
                     if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                        op_threshold = 0.01 if iteration==opt.densify_from_iter+opt.densification_interval else 0.01
+                        op_threshold = 0.005 if iteration==opt.opacity_reset_interval+opt.densify_from_iter else 0.005
                         gaussians.densify_and_prune(opt.densify_grad_threshold, op_threshold, self.model.bound*1.4, size_threshold)
                     
                     if iteration % opt.opacity_reset_interval == 0 or (iteration == opt.densify_from_iter):
