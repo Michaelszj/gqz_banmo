@@ -935,6 +935,10 @@ class v2s_trainer():
 #            self.optimizer.zero_grad()
             total_loss,aux_out = self.model(batch)
             total_loss = total_loss/self.accu_steps
+            if (self.model.total_steps)%self.accu_steps == 0:
+                delta_loss = self.model.get_delta_loss()
+                total_loss += delta_loss
+                aux_out['delta_loss'] = delta_loss
             total_loss.mean().backward()
             # import pdb;pdb.set_trace()
             

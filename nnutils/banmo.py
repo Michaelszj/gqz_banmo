@@ -227,7 +227,7 @@ class banmo(nn.Module):
         in_channels_xyz=3+3*self.num_freqs*2
         in_channels_dir=27
         self.gs_code_dim=9
-        
+        self.use_delta=True
             
         self.gaussians = GaussianModel(1,self.bound,code_dim=self.gs_code_dim)
         parser = argparse.ArgumentParser()
@@ -288,7 +288,7 @@ class banmo(nn.Module):
 
         # delta color, opacity...
         if True:
-            self.delta_net = MLP(code_dim=self.gs_code_dim,pose_dim=12*self.num_bones+env_code_dim,output_dim=11)
+            self.delta_net = MLP(code_dim=self.gs_code_dim,pose_dim=env_code_dim,output_dim=11)
             self.networks['delta_net'] = self.delta_net
             
         # optimize camera
@@ -454,7 +454,7 @@ class banmo(nn.Module):
                 gaussian_xyz[None,...],backward=False)
         gaussian_xyz_dfm = gaussian_xyz_dfm[0]
         
-        deltas = self.delta_net(gaussian_code,torch.cat([bone_rts_fw[0],env_code],dim=-1))
+        deltas = self.delta_net(gaussian_code,env_code)
         
         colors = self.gaussians._features_dc
         f_rest = self.gaussians._features_rest
@@ -484,7 +484,15 @@ class banmo(nn.Module):
         return output
         
         
-        
+    def get_delta_loss(self):
+        if not self.use_delta:
+            return 0
+        embedid = torch.range(0,self.num_fr).cuda().long()
+        env_code = self.env_code(embedid)
+        deltas = self.delta_net(self.gaussians._code,env_code).squeeze()
+        delta_loss = (deltas.mean(dim=0)**2).mean()
+        delta_weight = 0.1
+        return delta_loss*delta_weight
         
     def forward_default(self, batch):
         # import pdb;pdb.set_trace()
@@ -610,11 +618,11 @@ class banmo(nn.Module):
 
         # regularization of root poses
         if opts.root_sm:
-            root_sm_loss_1st = compute_root_sm_loss(rtk_all, self.data_offset)
+            # root_sm_loss_1st = compute_root_sm_loss(rtk_all, self.data_offset)
             root_sm_loss_2nd = compute_root_sm_2nd_loss(rtk_all, self.data_offset)
-            aux_out['root_sm_1st_loss'] = root_sm_loss_1st
+            # aux_out['root_sm_1st_loss'] = root_sm_loss_1st
             aux_out['root_sm_2nd_loss'] = root_sm_loss_2nd
-            total_loss = total_loss + root_sm_loss_1st*10 + root_sm_loss_2nd
+            total_loss = total_loss + root_sm_loss_2nd
 
 
         # if opts.eikonal_wt > 0:
@@ -1415,8 +1423,9 @@ class banmo(nn.Module):
             rtk[3,:] = K
             background = torch.tensor([0.,0.,0.]).cuda()
             results = self.main_render(rtk,(H,W),torch.tensor([i+self.data_offset[vid]],device=rtk.device),background=background,canonical=not use_deform)
-            
-            rgb = results['render'].moveaxis(0,-1).cpu().numpy()
+            rgb = results['render']
+            rgb[rgb>1.]=1.
+            rgb = rgb.moveaxis(0,-1).cpu().numpy()
             rgbs.append(rgb)
             if save_img:
                 cv2.imwrite('%s/%s_%03d_%05d.png'%(savedir,prefix,epoch,i), rgb[...,::-1]*255)

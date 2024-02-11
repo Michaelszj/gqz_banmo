@@ -5,7 +5,7 @@ seqname=$2
 use_human=$3
 use_symm=$4
 add_args=${*: 4:$#-1}
-num_epochs=240
+num_epochs=480
 batch_size=256
 
 model_prefix=cptest-5

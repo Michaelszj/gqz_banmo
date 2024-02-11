@@ -97,8 +97,10 @@ class MLP(nn.Module):
     def forward(self, code:torch.Tensor, pose:torch.Tensor):
         # code: (N, code_dim)
         # pose: (1, 6*num_bones)
-        input = torch.cat([code,pose.repeat(code.shape[0],1)],dim=-1)
-        output = self.net(input)
+        code = code[None,...] # (1, N, code_dim)
+        pose = pose[:,None,:] # (t, 1, 6*num_bones)
+        input = torch.cat([code.repeat(pose.shape[0],1,1),pose.repeat(1,code.shape[1],1)],dim=-1)
+        output = self.net(input).squeeze()
         return output
         
         
