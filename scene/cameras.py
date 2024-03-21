@@ -27,13 +27,15 @@ class Camera(nn.Module):
         self.T = T # .detach().cpu().numpy()
         self.FoVx = FoVx
         self.FoVy = FoVy
+        self.FoVx = np.deg2rad(49.1)
+        self.FoVy = np.deg2rad(49.1)
         self.image_name = image_name
 
         try:
             self.data_device = torch.device(data_device)
         except Exception as e:
             print(e)
-            print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
+            print(f"[Warning] Custom device {data_device} philed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
 
         # self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
@@ -70,4 +72,26 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
+        
+def rtk_from_angles(delta, phi, resolution=256, radius=1.):
+    rtk_novel = torch.zeros([4,4],dtype=torch.float32).cuda()
+    Rmat = torch.tensor([[-np.sin(delta),0.,-np.cos(delta)],
+                            [-np.cos(delta)*np.sin(phi),-np.cos(phi),np.sin(delta)*np.sin(phi)],
+                            [-np.cos(delta)*np.cos(phi),np.sin(phi),np.sin(delta)*np.cos(phi)]])
+    Tmat = torch.tensor([0.,0.,1.])*radius
+    r = float(resolution)
+    rtk_novel[3] = torch.tensor([r,r,r/2,r/2]).cuda()
+    rtk_novel[:3,:3] = Rmat
+    rtk_novel[:3,3]  = Tmat
+    return rtk_novel
+    
+def angles_from_rtk(rtk):
+    Rmat = rtk[:3,:3]
+    z = rtk[2]
+    phi = torch.arcsin(z[1])
+    cos_phi = torch.cos(phi)
+    theta = torch.arccos(-z[0]/cos_phi)
+    if z[2]<0:
+        theta = -theta
+    return theta.detach().cpu().numpy(), phi.detach().cpu().numpy()
 

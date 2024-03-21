@@ -14,6 +14,11 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 
+
+
+def sdf_loss(gt_mask,rendered_mask,sdf):
+    sdf[gt_mask<0.01] = -sdf[gt_mask<0.01]
+    return (((gt_mask-rendered_mask))*sdf).mean()
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 

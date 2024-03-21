@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy.spatial.transform import Rotation as R
-
+import math
 import sys
 sys.path.insert(0, 'third_party')
 from ext_utils.flowlib import warp_flow, cat_imgflo 
@@ -130,7 +130,6 @@ def rtk_to_4x4(rtk):
     device = rtk.device
     bs = rtk.shape[0]
     zero_one = torch.Tensor([[0,0,0,1]]).to(device).repeat(bs,1)
-
     rmat=rtk[:,:9]
     rmat=rmat.view(-1,3,3)
     tmat=rtk[:,9:12]
@@ -145,10 +144,8 @@ def rtk_compose(rtk1, rtk2):
     rtk_shape = rtk1.shape
     rtk1 = rtk1.view(-1,12)# ...,12
     rtk2 = rtk2.view(-1,12)# ...,12
-
     rts1 = rtk_to_4x4(rtk1)
     rts2 = rtk_to_4x4(rtk2)
-
     rts = rts1.matmul(rts2)
     rvec = rts[...,:3,:3].reshape(-1,9)
     tvec = rts[...,:3,3].reshape(-1,3)
@@ -232,7 +229,7 @@ def skinning_chunk(bones, pts, dskin=None, skin_aux=None):
     mdis = scale.view(bs,1,B,3) * mdis.pow(2)
     # log_scale (being optimized) controls temporature of the skinning weight softmax 
     # multiply 1000 to make the weights more concentrated initially
-    inv_temperature = 1000 * log_scale.exp()
+    inv_temperature = 200 * log_scale.exp()
     mdis = (-inv_temperature * mdis.sum(3)) # bs,N,B
 
     if dskin is not None:
@@ -281,42 +278,12 @@ def blend_skinning_chunk(bones, rts, skin, pts):
     rts = rts.view(-1,B,3,4)
     Rmat = rts[:,:,:3,:3] # bs, B, 3,3
     Tmat = rts[:,:,:3,3]
-    device = Tmat.device
-
-    ## convert from bone to root transforms
-    #bones = bones.view(-1,B,10)
-    #bs = Rmat.shape[0]
-    #center = bones[:,:,:3]
-    #orient = bones[:,:,3:7] # real first
-    #orient = F.normalize(orient, 2,-1)
-    #orient = transforms.quaternion_to_matrix(orient) # real first
-    #gmat = torch.eye(4)[None,None].repeat(bs, B, 1, 1).to(device)
-    #
-    ## root to bone
-    #gmat_r2b = gmat.clone()
-    #gmat_r2b[:,:,:3,:3] = orient.permute(0,1,3,2)
-    #gmat_r2b[:,:,:3,3] = -orient.permute(0,1,3,2).matmul(center[...,None])[...,0]
-   
-    ## bone to root
-    #gmat_b2r = gmat.clone()
-    #gmat_b2r[:,:,:3,:3] = orient
-    #gmat_b2r[:,:,:3,3] = center
-
-    ## bone to bone  
-    #gmat_b = gmat.clone()
-    #gmat_b[:,:,:3,:3] = Rmat
-    #gmat_b[:,:,:3,3] = Tmat
-   
-    #gmat = gmat_b2r.matmul(gmat_b.matmul(gmat_r2b))
-    #Rmat = gmat[:,:,:3,:3]
-    #Tmat = gmat[:,:,:3,3]
-
-    # Gi=sum(wbGb), V=RV+T
+    
     Rmat_w = (skin[...,None,None] * Rmat[:,None]).sum(2) # bs,N,B,3
     Tmat_w = (skin[...,None] * Tmat[:,None]).sum(2) # bs,N,B,3
     pts = Rmat_w.matmul(pts[...,None]) + Tmat_w[...,None] 
     pts = pts[...,0]
-    return pts
+    return pts, Rmat_w
 
 def blend_skinning(bones, rts, skin, pts):
     """
@@ -335,12 +302,15 @@ def blend_skinning(bones, rts, skin, pts):
     bs = pts.shape[0]
 
     pts_out = []
+    rots_out = []
     for i in range(0,bs,chunk):
-        pts_chunk = blend_skinning_chunk(bones[i:i+chunk], rts[i:i+chunk], 
+        pts_chunk,rot_chunk = blend_skinning_chunk(bones[i:i+chunk], rts[i:i+chunk], 
                                           skin[i:i+chunk], pts[i:i+chunk])
         pts_out.append(pts_chunk)
+        rots_out.append(rot_chunk)
     pts = torch.cat(pts_out,0)
-    return pts
+    rots = torch.cat(rots_out,0)
+    return pts, rots
 
 def lbs(bones, rts_fw, skin, xyz_in, backward=True):
     """
@@ -365,9 +335,9 @@ def lbs(bones, rts_fw, skin, xyz_in, backward=True):
         rts_bw = rts_invert(rts_fw)
         xyz = blend_skinning(bones_dfm, rts_bw, skin, xyz_in)
     else:
-        xyz = blend_skinning(bones.repeat(bs,1,1), rts_fw, skin, xyz_in)
+        xyz, rots = blend_skinning(bones.repeat(bs,1,1), rts_fw, skin, xyz_in)
         bones_dfm = bone_transform(bones, rts_fw) # bone coordinates after deform
-    return xyz, bones_dfm
+    return xyz, rots
 
 def obj_to_cam(in_verts, Rmat, Tmat):
     """
@@ -455,6 +425,26 @@ def K2inv(K):
     Kmat[:,1,2] = -K[:,3]/K[:,1]
     Kmat[:,2,2] = 1
     return Kmat
+
+def cartesian_to_spherical(xyz):
+    ptsnew = np.hstack((xyz, np.zeros(xyz.shape)))
+    xy = xyz[:,0]**2 + xyz[:,1]**2
+    z = np.sqrt(xy + xyz[:,2]**2)
+    theta = np.arctan2(np.sqrt(xy), xyz[:,2]) # for elevation angle defined from Z-axis down
+    #ptsnew[:,4] = np.arctan2(xyz[:,2], np.sqrt(xy)) # for elevation angle defined from XY-plane up
+    azimuth = np.arctan2(xyz[:,1], xyz[:,0])
+    return np.array([theta, azimuth, z])
+
+def get_T(T_target, T_cond):
+    theta_cond, azimuth_cond, z_cond = cartesian_to_spherical(T_cond[None, :])
+    theta_target, azimuth_target, z_target = cartesian_to_spherical(T_target[None, :])
+    
+    d_theta = theta_target - theta_cond
+    d_azimuth = (azimuth_target - azimuth_cond) % (2 * math.pi)
+    d_z = z_target - z_cond
+    
+    d_T = torch.tensor([d_theta.item(), math.sin(d_azimuth.item()), math.cos(d_azimuth.item()), 0.])
+    return d_T
 
 def pinhole_cam(in_verts, K):
     """
@@ -653,7 +643,7 @@ def generate_bones(num_bones_x, num_bones, bound, device):
     
     orient =  torch.Tensor([[1,0,0,0]]).to(device)
     orient = orient.repeat(num_bones,1)
-    scale = torch.zeros(num_bones,3).to(device)
+    scale = torch.ones(num_bones,3).to(device)/100.
     bones = torch.cat([center, orient, scale],-1)
     return bones
 
@@ -686,7 +676,9 @@ def reinit_bones(model, vertices, num_bones):
     center=center.to(device)
     orient =  torch.Tensor([[1,0,0,0]]).to(device)
     orient = orient.repeat(num_bones,1)
-    scale = torch.zeros(num_bones,3).to(device)
+    rot = torch.rand(num_bones,4).to(device)/3.
+    orient = torch.nn.functional.normalize(orient+rot)
+    scale = (torch.ones(num_bones,3).to(device)/100.+torch.rand(num_bones,3).to(device)/100.)/2.
     bones = torch.cat([center, orient, scale],-1)
 
     model.num_bones = num_bones
@@ -713,11 +705,11 @@ def correct_bones(model, bones_rst, inverse=False):
     bones_rst = bone_transform(bones_rst, bone_rts_rst, is_vec=True)[0] 
     return bones_rst, bone_rts_rst
 
-def correct_rest_pose(opts, bone_rts_fw, bone_rts_rst):
+def correct_rest_pose(num_bones, bone_rts_fw, bone_rts_rst):
     # delta rts
     bone_rts_fw = bone_rts_fw.clone()
     rts_shape = bone_rts_fw.shape
-    bone_rts_rst_inv = rtk_invert(bone_rts_rst, opts.num_bones)
+    bone_rts_rst_inv = rtk_invert(bone_rts_rst, num_bones)
     bone_rts_rst_inv = bone_rts_rst_inv.repeat(rts_shape[0],rts_shape[1],1)
     bone_rts_fw =     rtk_compose(bone_rts_rst_inv, bone_rts_fw)
     return bone_rts_fw
@@ -1508,3 +1500,49 @@ def fid_reindex(fid, num_vids, vid_offset):
         #tid[assign] = (tid[assign] - doffset/2)/1000.
     return vid, tid
 
+
+def length(x, eps=1e-20):
+    if isinstance(x, np.ndarray):
+        return np.sqrt(np.maximum(np.sum(x * x, axis=-1, keepdims=True), eps))
+    else:
+        return torch.sqrt(torch.clamp(dot(x, x), min=eps))
+def safe_normalize(x, eps=1e-20):
+        return x / length(x, eps)
+
+
+def look_at(campos, target, opengl=True):
+    # campos: [N, 3], camera/eye position
+    # target: [N, 3], object to look at
+    # return: [N, 3, 3], rotation matrix
+    if not opengl:
+        # camera forward aligns with -z
+        forward_vector = safe_normalize(target - campos)
+        up_vector = np.array([0, 1, 0], dtype=np.float32)
+        right_vector = safe_normalize(np.cross(forward_vector, up_vector))
+        up_vector = safe_normalize(np.cross(right_vector, forward_vector))
+    else:
+        # camera forward aligns with +z
+        forward_vector = safe_normalize(campos - target)
+        up_vector = np.array([0, 1, 0], dtype=np.float32)
+        right_vector = safe_normalize(np.cross(up_vector, forward_vector))
+        up_vector = safe_normalize(np.cross(forward_vector, right_vector))
+    R = np.stack([right_vector, up_vector, forward_vector], axis=1)
+    return R
+def orbit_camera(elevation, azimuth, radius=1, is_degree=True, target=None, opengl=True):
+    # radius: scalar
+    # elevation: scalar, in (-90, 90), from +y to -y is (-90, 90)
+    # azimuth: scalar, in (-180, 180), from +z to +x is (0, 90)
+    # return: [4, 4], camera pose matrix
+    if is_degree:
+        elevation = np.deg2rad(elevation)
+        azimuth = np.deg2rad(azimuth)
+    x = radius * np.cos(elevation) * np.sin(azimuth)
+    y = - radius * np.sin(elevation)
+    z = radius * np.cos(elevation) * np.cos(azimuth)
+    if target is None:
+        target = np.zeros([3], dtype=np.float32)
+    campos = np.array([x, y, z]) + target  # [3]
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = look_at(campos, target, opengl)
+    T[:3, 3] = campos
+    return T

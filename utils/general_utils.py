@@ -75,6 +75,14 @@ def strip_lowerdiag(L):
 def strip_symmetric(sym):
     return strip_lowerdiag(sym)
 
+def matrix2quaternion(m):
+    #m:array
+    w = ((torch.trace(m) + 1) ** 0.5) / 2 + 1e-4
+    x = (m[2][1] - m[1][2]) / (4 * w)
+    y = (m[0][2] - m[2][0]) / (4 * w)
+    z = (m[1][0] - m[0][1]) / (4 * w)
+    return torch.stack([w,x,y,z])
+
 def build_rotation(r):
     norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
 
@@ -108,6 +116,32 @@ def build_scaling_rotation(s, r):
 
     L = R @ L
     return L
+
+def build_covariance_auto(scaling, rotation, c2w_rot):
+    L = torch.zeros((scaling.shape[0], 3, 3), dtype=torch.float, device="cuda")
+    R = build_rotation(rotation)
+    L[:,0,0] = scaling[:,0]
+    L[:,1,1] = scaling[:,1]
+    L[:,2,2] = scaling[:,2]
+
+    L = c2w_rot @ R @ L
+    # L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+    actual_covariance = L @ L.transpose(1, 2)
+    symm = strip_symmetric(actual_covariance)
+    return symm
+
+def build_covariance_lbs(scaling, rotation, c2w_rot, lbs_rot):
+    L = torch.zeros((scaling.shape[0], 3, 3), dtype=torch.float, device="cuda")
+    R = build_rotation(rotation)
+    L[:,0,0] = scaling[:,0]
+    L[:,1,1] = scaling[:,1]
+    L[:,2,2] = scaling[:,2]
+
+    L = c2w_rot @ lbs_rot @ R @ L
+    # L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+    actual_covariance = L @ L.transpose(1, 2)
+    symm = strip_symmetric(actual_covariance)
+    return symm
 
 def safe_state(silent):
     old_f = sys.stdout

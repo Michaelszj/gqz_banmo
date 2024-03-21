@@ -79,16 +79,27 @@ class BaseDataset(Dataset):
         if len(shape) == 2:
             img = np.repeat(np.expand_dims(img, 2), 3, axis=2)
 
-        mask = cv2.imread(self.masklist[im0idx],0)
+        try:
+            mask = cv2.imread(self.masklist[im0idx])[:,:,0]
+        except:
+            mask = cv2.imread(self.masklist[im0idx][:-3]+'png')[:,:,0]
+        mask[mask>=128]=255
+        mask[mask<128] =0
         #print('mask+img:%f'%(time.time()-ss))
-        mask = mask/np.sort(np.unique(mask))[1]
+        # mask = mask/np.sort(np.unique(mask))[1]
         occluder = mask==255
-        mask[occluder] = 0
+        # mask[occluder] = 0
         if mask.shape[0]!=img.shape[0] or mask.shape[1]!=img.shape[1]:
             mask = cv2.resize(mask, img.shape[:2][::-1],interpolation=cv2.INTER_NEAREST)
             mask = binary_erosion(mask,iterations=2)
         mask = np.expand_dims(mask, 2)
         
+        # import pdb;pdb.set_trace()
+        try:
+            sdf = np.load(self.masklist[im0idx][:-3]+'npy')
+        except:
+            sdf = np.zeros([1])
+            # print(self.masklist[im0idx][:-3]+'npy')
         #print('mask sort:%f'%(time.time()-ss))
 
         # flow
@@ -110,7 +121,7 @@ class BaseDataset(Dataset):
             flow[...,0] *= factor_w
             flow[...,1] *= factor_h
         except:
-            print('warning: loading empty flow from %s'%(flowpath))
+            # print('warning: loading empty flow from %s'%(flowpath))
             flow = np.zeros_like(img)
             occ = np.zeros_like(mask)
         flow = flow[...,:2]
@@ -182,6 +193,7 @@ class BaseDataset(Dataset):
         rt_dict = {}
         rt_dict['img']   = img     
         rt_dict['mask']  = mask  
+        rt_dict['sdf']   = sdf
         rt_dict['flow']  = flow  
         rt_dict['occ']   = occ   
         rt_dict['dp']    = dp    
@@ -348,7 +360,7 @@ class BaseDataset(Dataset):
         if not self.feat_only:
             elem['img']           =  img        # s
             elem['mask']          =  mask       # s
-            elem['flow']          =  []# flow       # s
+            elem['flow']          =  flow       # s
             elem['occ']           =  []# occ        # s 
             elem['vis2d']         =  vis2d      # y
             elem['dp']            =  dp         # x
@@ -360,6 +372,9 @@ class BaseDataset(Dataset):
         elem['dataid']        =  dataid
         elem['frameid']       =  frameid
         elem['is_canonical']  =  is_canonical
+        elem['sdf']           =  rt_dict['sdf']
+        elem['is_fw']         =  flowfw
+        elem['dframe']        =  dframe
         return elem
 
     def preload_data(self, index):

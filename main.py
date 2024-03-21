@@ -12,7 +12,8 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 cudnn.benchmark = True
-
+import argparse
+from omegaconf import OmegaConf
 from nnutils.train_utils import v2s_trainer
 
 opts = flags.FLAGS
@@ -23,9 +24,12 @@ def main(_):
     torch.cuda.manual_seed(1)
     torch.manual_seed(0)
     
+    
+    # override default config from cli
+    extra_opt = OmegaConf.load(opts.config)
     trainer = v2s_trainer(opts)
-    data_info = trainer.init_dataset()    
-    trainer.define_model(data_info) 
+    data_info = trainer.init_dataset()  
+    trainer.define_model(data_info,extra_opt) 
     trainer.init_training()
     # import pdb;pdb.set_trace()
     trainer.train()

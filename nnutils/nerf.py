@@ -290,6 +290,12 @@ class RTHead(NeRF):
         rts = torch.cat([rmat,tmat],-1)
         rts = rts.view(bs,1,-1)
         return rts
+    
+    def get_raw(self, x):
+        x = super(RTHead, self).forward(x)
+        bs = x.shape[0]
+        rts = x.view(-1,self.num_output)
+        return rts
             
 
 class FrameCode(nn.Module):

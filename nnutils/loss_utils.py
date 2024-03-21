@@ -9,6 +9,36 @@ from nnutils.geom_utils import rot_angle, mat2K, Kmatinv, obj_to_cam, \
                                 pinhole_cam, lbs, gauss_mlp_skinning, evaluate_mlp
 import torch.nn.functional as F
 
+
+
+
+def get_jacobian(y, x, create_graph=True):
+    jac = []
+    for i in range(y.size(1)):
+        grad_output = torch.zeros_like(y)
+        grad_output[:, i] = 1
+        jac.append(torch.autograd.grad(y, x, grad_output, retain_graph=True, create_graph=create_graph)[0])
+    return torch.stack(jac, dim=1)
+    
+
+def rigid_loss(jac):
+    # jac = get_jacobian(y, x)
+    U, S, V = torch.linalg.svd(jac)
+    scales = S[:,[[0,0],[1,1],[2,2]]]
+    return (scales-1).pow(2).mean()
+    
+    
+
+def gradient_x(img: torch.Tensor) -> torch.Tensor:
+    return img[:, :-1] - img[:, 1:]
+
+def gradient_y(img: torch.Tensor) -> torch.Tensor:
+    return img[:-1, :] - img[1:, :]
+
+def depth_smooth_loss(depth):
+    grad_x, grad_y = gradient_x(depth), gradient_y(depth)
+    return (grad_x.abs().mean() + grad_y.abs().mean()) / 2.
+
 def nerf_gradient(mlp, embed, pts, use_xyz=False,code=None, sigma_only=False):
     """
     gradient of mlp params wrt pts

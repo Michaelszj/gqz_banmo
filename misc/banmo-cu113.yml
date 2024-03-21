@@ -1,4 +1,4 @@
-name: banmo-cu113
+name: banmo-gs
 channels:
   - pytorch
   - pytorch3d

@@ -352,6 +352,11 @@ def get_config_info(opts, config, name, dataid, is_eval=False):
         rtk_path = '%s/%s'%(rtk_path, datapath.strip('/').split('/')[-1])
     
     imglist = sorted(glob.glob('%s/*'%datapath))
+    newlist = []
+    for img in imglist:
+        if img[-3:]=='jpg':
+            newlist.append(img)
+    imglist = sorted(newlist)
     try: flip=int(config.get(name, 'flip'))
     except: flip=0
 
@@ -490,7 +495,8 @@ class VidDataset(base_data.BaseDataset):
         self.dframe = dframe
         seqname = imglist[0].split('/')[-2]
        
-        self.masklist = [i.replace('JPEGImages', 'Annotations').replace('.jpg', '.png') for i in self.imglist] 
+        # self.masklist = [i.replace('JPEGImages', 'Annotations').replace('.jpg', '.png') for i in self.imglist] 
+        self.masklist = [i.replace('imgs', 'masks') for i in self.imglist] 
         self.camlist =  [i.replace('JPEGImages', 'Camera').replace('.jpg', '.txt') for i in self.imglist]
       
         if dframe==1:

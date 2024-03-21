@@ -5,10 +5,10 @@ seqname=$2
 use_human=$3
 use_symm=$4
 add_args=${*: 4:$#-1}
-num_epochs=480
+num_epochs=481
 batch_size=256
 
-model_prefix=cptest-5
+model_prefix=eval-$seqname
 if [ "$use_human" = "" ]; then
   pose_cnn_path=mesh_material/posenet/human.pth
 else
@@ -17,7 +17,7 @@ fi
 echo $pose_cnn_path
 
 # mode: line load
-savename=${model_prefix}-init
+savename=${model_prefix}-exp
 bash scripts/template-mgpu.sh $gpus $savename \
     $seqname $addr --num_epochs $num_epochs \
   --pose_cnn_path $pose_cnn_path \
@@ -25,6 +25,7 @@ bash scripts/template-mgpu.sh $gpus $savename \
   --lineload --batch_size $batch_size\
   --${use_symm}symm_shape \
   --${use_human}use_human \
+  --config image.yaml
   $add_args
 
 # mode: pose correction

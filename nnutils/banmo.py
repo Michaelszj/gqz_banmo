@@ -13,7 +13,9 @@ import cv2, numpy as np, time, torch, torchvision
 import torch.nn as nn
 from torch.autograd import Variable
 import torch.nn.functional as F
-import trimesh, pytorch3d, pytorch3d.loss, pdb
+import random
+# import trimesh, pytorch3d, pytorch3d.loss, pdb
+import pytorch3d, pytorch3d.loss
 from pytorch3d import transforms
 import configparser
 import argparse
@@ -29,20 +31,19 @@ from nnutils.geom_utils import K2mat, mat2K, Kmatinv, K2inv, raycast, sample_xy,
                                 render_color, mask_aug, bbox_dp2rnd, resample_dp, \
                                 vrender_flo, get_near_far, array2tensor, rot_angle, \
                                 rtk_invert, rtk_compose, bone_transform, correct_bones,\
-                                correct_rest_pose, fid_reindex, skinning, lbs
+                                correct_rest_pose, fid_reindex, skinning, lbs,get_T,orbit_camera
 from nnutils.rendering import render_rays
-from nnutils.loss_utils import eikonal_loss, rtk_loss, \
-                            feat_match_loss, kp_reproj_loss, grad_update_bone, \
-                            loss_filter, loss_filter_line, compute_xyz_wt_loss,\
-                            compute_root_sm_2nd_loss, shape_init_loss, compute_root_sm_loss
+from nnutils.loss_utils import *
 from tqdm import tqdm
 from utils.io import draw_pts,save_vid,draw_cams
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, sdf_loss
 from scene.gaussian_model import GaussianModel
-from scene.cameras import Camera
-from gaussian_renderer import render_auto,render
+from scene.cameras import Camera, rtk_from_angles, angles_from_rtk
+from gaussian_renderer import render_auto,render,render_points
 import torch.nn.functional as F
-
+# from diffusers import DDIMScheduler
+from torch.utils.tensorboard import SummaryWriter
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 # distributed data parallel
 flags.DEFINE_integer('local_rank', 0, 'for distributed training')
 flags.DEFINE_integer('ngpu', 1, 'number of gpus to use')
@@ -55,6 +56,7 @@ flags.DEFINE_string('checkpoint_dir', 'logdir/', 'Root directory for output file
 flags.DEFINE_string('model_path', '', 'load model path')
 flags.DEFINE_string('pose_cnn_path', '', 'path to pre-trained pose cnn')
 flags.DEFINE_string('rtk_path', '', 'path to rtk files')
+flags.DEFINE_string('config', '', 'path to config files')
 flags.DEFINE_bool('lineload',False,'whether to use pre-computed data per line')
 flags.DEFINE_integer('n_data_workers', 1, 'Number of data loading workers')
 flags.DEFINE_boolean('use_rtk_file', False, 'whether to use input rtk files')
@@ -171,7 +173,11 @@ flags.DEFINE_bool('rm_novp', True,'whether to remove loss on non-overlapping pxs
 flags.DEFINE_string('match_frames', '0 1', 'a list of frame index')
 
 class banmo(nn.Module):
-    def __init__(self, opts, data_info):
+    writer: SummaryWriter
+    save_dir : str
+    camera_radius : float
+    target : int
+    def __init__(self, opts, data_info, extra_opt):
         super(banmo, self).__init__()
         self.opts = opts
         self.device = torch.device("cuda:%d"%opts.local_rank)
@@ -204,42 +210,47 @@ class banmo(nn.Module):
         self.max_ts = (self.data_offset[1:] - self.data_offset[:-1]).max()
         self.impath      = data_info['impath']
         self.latest_vars = {}
-        # only used in get_near_far: rtk, idk
-        # only used in visibility: rtk, vis, idx (deprecated)
-        # raw rot/trans estimated by pose net
-        self.latest_vars['rt_raw'] = np.zeros((self.data_offset[-1], 3,4)) # from data
-        # rtk raw scaled and refined
         self.latest_vars['rtk'] = np.zeros((self.data_offset[-1], 4,4))
-        self.latest_vars['idk'] = np.zeros((self.data_offset[-1],))
-        self.latest_vars['kaug'] = np.zeros((self.data_offset[-1],4))
-        self.latest_vars['mesh_rest'] = trimesh.Trimesh()
         
-        self.latest_vars['fp_err'] =       np.zeros((self.data_offset[-1],2)) # feat, proj
-        self.latest_vars['flo_err'] =      np.zeros((self.data_offset[-1],6)) 
-        self.latest_vars['sil_err'] =      np.zeros((self.data_offset[-1],)) 
-        self.latest_vars['flo_err_hist'] = np.zeros((self.data_offset[-1],6,10))
-
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=True)
+        for param in self.lpips.parameters(): 
+            param.requires_grad=False
         
-        self.bound = .05
+        self.bound = .5
         self.obj_scale = 10.
         # set shape/appearancce model
         self.num_freqs = 10
         in_channels_xyz=3+3*self.num_freqs*2
         in_channels_dir=27
         self.gs_code_dim=9
-        self.use_delta=True
+        self.use_delta=False
             
-        self.gaussians = GaussianModel(1,self.bound,code_dim=self.gs_code_dim)
-        parser = argparse.ArgumentParser()
-        op = OptimizationParams(parser)
-        op.iterations = self.num_epochs*self.num_fr
-        op.densify_until_iter = self.num_epochs*self.num_fr//2
-        self.gaussians.random_init()
+        self.gaussians = GaussianModel(0,self.bound,code_dim=self.gs_code_dim)
+        self.gaussians.active_sh_degree = 0
+        # parser = argparse.ArgumentParser()
+        # op = OptimizationParams(parser)
+        # op.iterations = self.num_epochs*self.num_fr
+        # op.densify_until_iter = self.num_epochs*self.num_fr*(2/4)
+        op = extra_opt
+        # self.gaussians.random_init(sphere=True,disturb=False)
+        self.gaussians.initialize(num_pts=op.num_pts*10,radius=self.bound)
         self.gaussians.training_setup(op)
         self.optim = op
+        self.camera_radius = op.radius
         self.networks= {}
-
+        
+        self.use_diffusion = False
+        if self.use_diffusion:
+            from nnutils.zero123_utils import Zero123
+            self.guidance_zero123 = Zero123(self.device)
+            # from nnutils.imagedream_utils import ImageDream
+            # self.guidance_zero123 = ImageDream(self.device)
+            # self.neg_prompt = "ugly, bad anatomy, blurry, pixelated obscure, unnatural colors, poor lighting, dull, and unclear, \
+            # cropped, lowres, low quality, artifacts, duplicate, morbid, mutilated, poorly drawn face, deformed, dehydrated, bad proportions"
+        
+        # import pdb;pdb.set_trace()
         # env embedding
+        
         if opts.env_code:
             # add video-speficit environment lighting embedding
             env_code_dim = 64
@@ -260,6 +271,7 @@ class banmo(nn.Module):
         # bone transform
         if opts.lbs:
             self.num_bones = opts.num_bones
+            print('num_bones:',self.num_bones)
             bones= generate_bones(self.num_bones, self.num_bones, 0, self.device)
             self.bones = nn.Parameter(bones)
             self.num_bone_used = self.num_bones # bones used in the model
@@ -270,6 +282,9 @@ class banmo(nn.Module):
                                 out_channels=6*self.num_bones, raw_feat=True))
             self.networks['bones'] = self.bones
             self.networks['nerf_body_rts'] = self.nerf_body_rts
+            self.bone_colors = torch.rand(self.num_bones,3).to(self.device)
+            self.bones_rts_frame = nn.Parameter(torch.zeros(self.num_fr,self.num_bones,6),requires_grad=True)
+            self.bone_optimizer = torch.optim.Adam([self.bones_rts_frame],lr=0.0005)
             
         # skinning weights
         if opts.nerf_skin:
@@ -290,15 +305,10 @@ class banmo(nn.Module):
         if True:
             self.delta_net = MLP(code_dim=self.gs_code_dim,pose_dim=env_code_dim,output_dim=11)
             self.networks['delta_net'] = self.delta_net
+            self.use_delta_scale=False
             
         # optimize camera
         if opts.root_opt:
-            if self.use_cam: 
-                use_quat=False
-                out_channels=6
-            else:
-                use_quat=True
-                out_channels=7
             # train a cnn pose predictor for warmup
             cnn_in_channels = 16
 
@@ -308,26 +318,9 @@ class banmo(nn.Module):
             self.dp_root_rts = nn.Sequential(
                             Encoder((112,112), in_channels=cnn_in_channels,
                                 out_channels=128), cnn_head)
-            if self.root_basis == 'cnn':
-                self.nerf_root_rts = nn.Sequential(
-                                Encoder((112,112), in_channels=cnn_in_channels,
-                                out_channels=128),
-                                RTHead(use_quat=use_quat, D=1,
-                                in_channels_xyz=128,in_channels_dir=0,
-                                out_channels=out_channels, raw_feat=True))
-            elif self.root_basis == 'exp':
-                self.nerf_root_rts = RTExplicit(self.num_fr, delta=self.use_cam)
-            elif self.root_basis == 'expmlp':
-                self.nerf_root_rts = RTExpMLP(self.num_fr, 
-                                  self.num_freqs,t_embed_dim,self.data_offset,
-                                  delta=self.use_cam)
-            elif self.root_basis == 'mlp':
-                self.root_code = embed_net(self.num_fr, t_embed_dim)
-                output_head =   RTHead(use_quat=use_quat, 
-                            in_channels_xyz=t_embed_dim,in_channels_dir=0,
-                            out_channels=out_channels, raw_feat=True)
-                self.nerf_root_rts = nn.Sequential(self.root_code, output_head)
-            else: print('error'); exit()
+            self.nerf_root_rts = RTExpMLP(self.num_fr, 
+                                self.num_freqs,t_embed_dim,self.data_offset,
+                                delta=self.use_cam)
             self.networks['nerf_root_rts'] = self.nerf_root_rts
 
         # intrinsics
@@ -339,91 +332,24 @@ class banmo(nn.Module):
         self.ks_param = torch.Tensor(ks_list).to(self.device)
         if opts.ks_opt:
             self.ks_param = nn.Parameter(self.ks_param)
-            
-
-    #     # densepose
-    #     detbase='./third_party/detectron2/'
-    #     if opts.use_human:
-    #         canonical_mesh_name = 'smpl_27554'
-    #         config_path = '%s/projects/DensePose/configs/cse/densepose_rcnn_R_101_FPN_DL_soft_s1x.yaml'%(detbase)
-    #         weight_path = 'https://dl.fbaipublicfiles.com/densepose/cse/densepose_rcnn_R_101_FPN_DL_soft_s1x/250713061/model_final_1d3314.pkl'
-    #     else:
-    #         canonical_mesh_name = 'sheep_5004'
-    #         config_path = '%s/projects/DensePose/configs/cse/densepose_rcnn_R_50_FPN_soft_animals_CA_finetune_4k.yaml'%(detbase)
-    #         weight_path = 'https://dl.fbaipublicfiles.com/densepose/cse/densepose_rcnn_R_50_FPN_soft_animals_CA_finetune_4k/253498611/model_final_6d69b7.pkl'
-    #     canonical_mesh_path = 'mesh_material/%s_sph.pkl'%canonical_mesh_name
         
-    #     with open(canonical_mesh_path, 'rb') as f:
-    #         dp = pickle.load(f)
-    #         self.dp_verts = dp['vertices']
-    #         self.dp_faces = dp['faces'].astype(int)
-    #         self.dp_verts = torch.Tensor(self.dp_verts).cuda(self.device)
-    #         self.dp_faces = torch.Tensor(self.dp_faces).cuda(self.device).long()
-            
-    #         self.dp_verts -= self.dp_verts.mean(0)[None]
-    #         self.dp_verts /= self.dp_verts.abs().max()
-    #         self.dp_verts_unit = self.dp_verts.clone()
-    #         self.dp_verts *= (self.near_far[:,1] - self.near_far[:,0]).mean()/2
-            
-    #         # visualize
-    #         self.dp_vis = self.dp_verts.detach()
-    #         self.dp_vmin = self.dp_vis.min(0)[0][None]
-    #         self.dp_vis = self.dp_vis - self.dp_vmin
-    #         self.dp_vmax = self.dp_vis.max(0)[0][None]
-    #         self.dp_vis = self.dp_vis / self.dp_vmax
-
-    #         # save colorvis
-    #         if not os.path.isdir('tmp'): os.mkdir('tmp')
-    #         trimesh.Trimesh(self.dp_verts_unit.cpu().numpy(), 
-    #                         dp['faces'], 
-    #                         vertex_colors = self.dp_vis.cpu().numpy())\
-    #                         .export('tmp/%s.obj'%canonical_mesh_name)
-            
-    #         if opts.unc_filter:
-    #             from utils.cselib import create_cse
-    #             # load surface embedding
-    #             _, _, mesh_vertex_embeddings = create_cse(config_path,
-    #                                                             weight_path)
-    #             self.dp_embed = mesh_vertex_embeddings[canonical_mesh_name]
-
-    #     # add densepose mlp
-    #     if opts.use_embed:
-    #         self.num_feat = 16
-    #         # TODO change this to D-8
-    #         self.nerf_feat = NeRF(in_channels_xyz=in_channels_xyz, D=5, W=128,
-    #  out_channels=self.num_feat,in_channels_dir=0, raw_feat=True, init_beta=1.)
-    #         self.networks['nerf_feat'] = self.nerf_feat
-
-    #         if opts.ft_cse:
-    #             from nnutils.cse import CSENet
-    #             self.csenet = CSENet(ishuman=opts.use_human)
-
-
-        # # add uncertainty MLP
-        # if opts.use_unc:
-        #     # input, (x,y,t)+code, output, (1)
-        #     vid_code_dim=32  # add video-specific code
-        #     self.vid_code = embed_net(self.num_vid, vid_code_dim)
-        #     #self.nerf_unc = NeRFUnc(in_channels_xyz=in_channels_xyz, D=5, W=128,
-        #     self.nerf_unc = NeRFUnc(in_channels_xyz=in_channels_xyz, D=8, W=256,
-        #  out_channels=1,in_channels_dir=vid_code_dim, raw_feat=True, init_beta=1.)
-        #     self.networks['nerf_unc'] = self.nerf_unc
-
-        # if opts.warmup_pose_ep>0:
-        #     # soft renderer
-        #     import soft_renderer as sr
-        #     self.mesh_renderer = sr.SoftRenderer(image_size=256, sigma_val=1e-12, 
-        #                    camera_mode='look_at',perspective=False, aggr_func_rgb='hard',
-        #                    light_mode='vertex', light_intensity_ambient=1.,light_intensity_directionals=0.)
 
 
         self.resnet_transform = torchvision.transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225])
 
-    
+    def save_bones(self):
+        torch.save(self.bones_rts_frame.detach().cpu(),osp.join(self.save_dir,'bones_rts_frame.pth'))
+        torch.save(self.bones.detach().cpu(),osp.join(self.save_dir,'bones.pth'))
+        torch.save(self.bone_colors.detach().cpu(),osp.join(self.save_dir,'bone_colors.pth'))
+        
+    def load_bones(self,path):
+        self.bones_rts_frame = nn.Parameter(torch.load(osp.join(path,'bones_rts_frame.pth')).to(self.device))
+        self.bones = nn.Parameter(torch.load(osp.join(path,'bones.pth')).to(self.device))
+        self.bone_colors = torch.load(osp.join(path,'bone_colors.pth')).to(self.device)
 
-    def main_render(self,rtk,img_size,embedid,use_dskin=False,background=torch.tensor([0.,0.,0.]).cuda(),canonical=False):
+    def main_render(self,rtk,img_size,embedid,use_dskin=False,background=torch.tensor([0.,0.,0.]).cuda(),canonical=False,render_xyz=False,get_rigid_loss=False,bone_color=False):
         # rtk: (4,4)
         H,W = img_size
         R = rtk[:3,:3]
@@ -434,54 +360,226 @@ class banmo(nn.Module):
         cam = Camera(0, R, T, FovX, FovY,
                  None, None, '', 0, width=W, height=H)
         
-        if canonical:
-            output = render(cam,self.gaussians,background)
-            return output
         
         gaussian_xyz =self.gaussians._xyz
-        gaussian_code = self.gaussians._code
-        pose_code = self.pose_code(embedid)
-        env_code = self.env_code(embedid)
-        bones_rst = self.bones
-        bone_rts_fw = self.nerf_body_rts(embedid)
-        
-        skin = skinning(bones_rst, gaussian_xyz[None,...], skin_aux=self.skin_aux).squeeze()
-        if use_dskin:
-            dskin = self.nerf_skin(gaussian_code,pose_code)
-            skin = skin + dskin
+        # gaussian_code = self.gaussians._code
+        try:
+            color_replace=self.color_replace
+        except:
+            color_replace=None
+        if bone_color:
+            bones_rst = self.bones.clone()
+            rest_pose_code =  self.rest_pose_code
+            rest_pose_code = rest_pose_code(torch.Tensor([0]).long().to(self.device))
+            rts_head = self.nerf_body_rts[1]
+            bone_rts_rst = rts_head(rest_pose_code)[0]
+            bones_rst = bone_transform(bones_rst, bone_rts_rst, is_vec=True)[0] 
+            bone_rts_fw = self.nerf_body_rts(embedid)
+            bone_fw_trans = correct_rest_pose(self.num_bones, bone_rts_fw, bone_rts_rst)
+            skin = skinning(bones_rst, gaussian_xyz[None,...], skin_aux=self.skin_aux).squeeze()
             
-        gaussian_xyz_dfm, bones_dfm = lbs(bones_rst[None,...], bone_rts_fw[None,...], skin[None,...], 
+            color_replace = (skin.squeeze()[...,None]*self.bone_colors).sum(dim=1).detach()
+            if canonical:
+                bone_new = bones_rst
+            else:
+                bone_new = bone_transform(self.bones, bone_rts_fw, is_vec=True)[0]
+            color_new = self.bone_colors
+            # bone_vis = render_points(cam, bone_new, color_new, background)
+        
+        if canonical:
+            # output = render(cam,self.gaussians,background)
+            if bone_color:
+                output = render_auto(cam,self.gaussians._xyz,None,
+                                self.gaussians,background,color_replace=color_replace,rot_delta=None,append_points=bone_new,append_color=color_new)
+                # output['bone_vis'] = bone_vis['render']
+            else:
+                output = render(cam,self.gaussians,background)
+            return output
+        
+        
+        if not bone_color:
+            bones_rst = self.bones.clone()
+            rest_pose_code =  self.rest_pose_code
+            rest_pose_code = rest_pose_code(torch.Tensor([0]).long().to(self.device))
+            rts_head = self.nerf_body_rts[1]
+            bone_rts_rst = rts_head(rest_pose_code)[0]
+            bones_rst = bone_transform(bones_rst, bone_rts_rst, is_vec=True)[0] 
+            bone_rts_fw = self.nerf_body_rts(embedid)
+            bone_fw_trans = correct_rest_pose(self.num_bones, bone_rts_fw, bone_rts_rst)
+            skin = skinning(bones_rst, gaussian_xyz[None,...], skin_aux=self.skin_aux).squeeze()
+            
+        
+        gaussian_xyz_dfm, rots = lbs(bones_rst[None,...], bone_fw_trans[None,...], skin[None,...], 
                 gaussian_xyz[None,...],backward=False)
         gaussian_xyz_dfm = gaussian_xyz_dfm[0]
         
-        deltas = self.delta_net(gaussian_code,env_code)
+        # deltas = self.delta_net(gaussian_code,env_code)
         
         colors = self.gaussians._features_dc
         f_rest = self.gaussians._features_rest
-        scales = self.gaussians._scaling
-        rotations = self.gaussians._rotation
-        opacities = self.gaussians._opacity
         
-        d_color, d_scale, d_rotation, d_opacity = torch.split(deltas,[3,3,4,1],dim=-1)
-        colors_t = colors+d_color.unsqueeze(1)
-        # colors_t = torch.sigmoid(colors_t)
+        # d_color, d_scale, d_rotation, d_opacity = torch.split(deltas,[3,3,4,1],dim=-1)
+        # colors_t = colors+d_color.unsqueeze(1)
+        colors_t = colors
+    
         
-        scales_t = scales+d_scale
-        scales_t = torch.exp(scales_t)
+            
+        jac = get_jacobian(gaussian_xyz_dfm,self.gaussians._xyz)
         
-        # d_rotation[:,0] += 1.
+        append_points = None
+        append_color  = None
+        if bone_color:
+            append_points = bone_new
+            append_color = color_new
         # import pdb;pdb.set_trace()
-        rotations_t = rotations+d_rotation
-        rotations_t = F.normalize(rotations_t,dim=-1)
-        
-        opacities_t = opacities+d_opacity
-        opacities_t = torch.sigmoid(opacities_t)
+        output = render_auto(cam,gaussian_xyz_dfm,torch.cat([colors_t,f_rest],dim=-2),
+                             self.gaussians,background,color_replace=color_replace,rot_delta=jac,append_points=append_points,append_color=append_color)#.transpose(1,2))
         
         
-        # import pdb;pdb.set_trace()
-        output = render_auto(cam,gaussian_xyz_dfm,scales_t,rotations_t,torch.cat([colors_t,f_rest],dim=-2),opacities_t,
-                             self.gaussians,background)
+        if get_rigid_loss:
+            rig_loss = rigid_loss(jac)
+            output['rigid_loss'] = rig_loss
+        
+        # if bone_color:
+        #     output['bone_vis'] = bone_vis['render']
+        
+        if render_xyz:
+            output_xyz = render_auto(cam,gaussian_xyz_dfm,torch.cat([colors_t,f_rest],dim=-2),
+                             self.gaussians,background,color_replace=self.gaussians._xyz,rot_delta=jac)
+            output['location'] = output_xyz['render'].moveaxis(0,-1)
+            alpha = output_xyz['mask'].squeeze()
+            output['location'][alpha>0.] /= alpha[alpha>0.][...,None]
         return output
+        
+        
+    def flatten(self,rts):
+        tmat= rts[:,0:3] *0.1
+        rot=rts[:,3:6]
+        rmat = transforms.so3_exponential_map(rot)
+        rmat = rmat.view(-1,9)
+        rts = torch.cat([rmat,tmat],-1)
+        rts = rts.view(1,1,-1)
+        return rts
+    
+    def bone_render(self,rtk,img_size,embedid,background=torch.tensor([0.,0.,0.]).cuda(),canonical=False,render_xyz=False,get_rigid_loss=False,bone_color=False):
+        # rtk: (4,4)
+        H,W = img_size
+        R = rtk[:3,:3]
+        T = rtk[:3,3:]
+        K = rtk[3]
+        FovX = 2. * torch.arctan(W / (2. * K[0]))
+        FovY = 2. * torch.arctan(H / (2. * K[1]))
+        cam = Camera(0, R, T, FovX, FovY,
+                 None, None, '', 0, width=W, height=H)
+        
+        
+        gaussian_xyz =self.gaussians._xyz
+        # gaussian_code = self.gaussians._code
+        try:
+            color_replace=self.color_replace
+        except:
+            color_replace=None
+        if bone_color:
+            bones_rst = self.bones.clone()
+            rest_pose_code =  self.rest_pose_code
+            rest_pose_code = rest_pose_code(torch.Tensor([0]).long().to(self.device))
+            rts_head = self.nerf_body_rts[1]
+            bone_rts_rst = rts_head(rest_pose_code)[0]
+            bones_rst = bone_transform(bones_rst, bone_rts_rst, is_vec=True)[0] 
+            bone_rts_fw = self.flatten(self.bones_rts_frame[embedid][0])
+            bone_fw_trans = correct_rest_pose(self.num_bones, bone_rts_fw, bone_rts_rst)
+            skin = skinning(bones_rst, gaussian_xyz[None,...], skin_aux=self.skin_aux).squeeze()
+            
+            color_replace = (skin.squeeze()[...,None]*self.bone_colors).sum(dim=1).detach()
+            if canonical:
+                bone_new = bones_rst
+            else:
+                bone_new = bone_transform(self.bones, bone_rts_fw, is_vec=True)[0]
+            color_new = self.bone_colors
+            # bone_vis = render_points(cam, bone_new, color_new, background)
+        
+        if canonical:
+            # output = render(cam,self.gaussians,background)
+            if bone_color:
+                output = render_auto(cam,self.gaussians._xyz,None,
+                                self.gaussians,background,color_replace=color_replace,rot_delta=None,append_points=bone_new,append_color=color_new)
+                # output['bone_vis'] = bone_vis['render']
+            else:
+                output = render(cam,self.gaussians,background)
+            return output
+        
+        
+        if not bone_color:
+            bones_rst = self.bones.clone()
+            rest_pose_code =  self.rest_pose_code
+            rest_pose_code = rest_pose_code(torch.Tensor([0]).long().to(self.device))
+            rts_head = self.nerf_body_rts[1]
+            bone_rts_rst = rts_head(rest_pose_code)[0]
+            bones_rst = bone_transform(bones_rst, bone_rts_rst, is_vec=True)[0] 
+            bone_rts_fw = self.flatten(self.bones_rts_frame[embedid][0])
+            bone_fw_trans = correct_rest_pose(self.num_bones, bone_rts_fw, bone_rts_rst)
+            skin = skinning(bones_rst, gaussian_xyz[None,...], skin_aux=self.skin_aux).squeeze()
+            
+        
+        gaussian_xyz_dfm, rots = lbs(bones_rst[None,...], bone_fw_trans[None,...], skin[None,...], 
+                gaussian_xyz[None,...],backward=False)
+        gaussian_xyz_dfm = gaussian_xyz_dfm[0]
+        
+        
+        colors = self.gaussians._features_dc
+        f_rest = self.gaussians._features_rest
+        
+        colors_t = colors
+    
+        
+            
+        jac = get_jacobian(gaussian_xyz_dfm,self.gaussians._xyz)
+        
+        append_points = None
+        append_color  = None
+        if bone_color:
+            append_points = bone_new
+            append_color = color_new
+        # import pdb;pdb.set_trace()
+        # print(rots.shape,jac.shape)
+        output = render_auto(cam,gaussian_xyz_dfm,torch.cat([colors_t,f_rest],dim=-2),
+                             self.gaussians,background,color_replace=color_replace,rot_delta=jac,append_points=append_points,append_color=append_color)#.transpose(1,2))
+        
+        
+        if get_rigid_loss:
+            rig_loss = rigid_loss(jac)
+            output['rigid_loss'] = rig_loss
+        
+        
+        if render_xyz:
+            output_xyz = render_auto(cam,gaussian_xyz_dfm,torch.cat([colors_t,f_rest],dim=-2),
+                             self.gaussians,background,color_replace=self.gaussians._xyz,rot_delta=jac)
+            output['location'] = output_xyz['render'].moveaxis(0,-1)
+            alpha = output_xyz['mask'].squeeze()
+            output['location'][alpha>0.] /= alpha[alpha>0.][...,None]
+        return output
+        
+        
+    def visualize(self,fid,theta=np.pi,fai=0.,canonical=False,bone_color=False):
+        angle = theta
+        fai = fai
+        Rmat = torch.tensor([[-np.sin(angle),0.,-np.cos(angle)],
+                                [-np.cos(angle)*np.sin(fai),-np.cos(fai),np.sin(angle)*np.sin(fai)],    
+                                [-np.cos(angle)*np.cos(fai),np.sin(fai),np.sin(angle)*np.cos(fai)]])
+        Tmat = torch.tensor([0.,0.,1.])*2.
+        K = torch.tensor([512.,512.,256.,256.])
+        H=W=512
+        rtk = torch.zeros(4,4).cuda()
+        rtk[:3,:3] = Rmat
+        rtk[:3,3] = Tmat
+        rtk[3,:] = K
+        background = torch.tensor([1.,1.,1.]).cuda()
+        id = torch.tensor([fid],device=rtk.device)
+        results = self.bone_render(rtk,(H,W),id,
+                                background=background,canonical=canonical,bone_color=bone_color)
+        rgb = results['render'].clamp(0,1)
+        rgb = rgb.moveaxis(0,-1).detach().cpu().numpy()
+        return rgb
         
         
     def get_delta_loss(self):
@@ -494,11 +592,158 @@ class banmo(nn.Module):
         delta_weight = 0.1
         return delta_loss*delta_weight
         
-    def forward_default(self, batch):
+        
+        
+    def warmup_canonical(self, batch, save_dir):
+
+        # import pdb;pdb.set_trace()
+        # torch.cuda.empty_cache()
+        opts = self.opts
+        rtk = self.compute_rts(torch.Tensor([batch['frameid']]).to(self.device).long())[0]
+        rtk = torch.cat([rtk,self.ks_param[torch.Tensor([batch['dataid']]).to(self.device).long()]],dim=0).detach()
+        gt_theta, gt_phi = angles_from_rtk(rtk)
+        gt_theta = 0.
+        gt_phi = 0.
+        rtk = rtk_from_angles(gt_theta, gt_phi,radius = self.camera_radius)
+        rtk[3] = self.ks_param[torch.Tensor([batch['dataid']]).to(self.device).long()]
+        rtk[3,3] = 960.
+        rtk[3,2] = 960.
+        embedid=torch.Tensor([batch['frameid']]).to(self.device).long()+self.data_offset[torch.Tensor([batch['dataid']]).long()]
+        embedid.requires_grad=False
+        H = batch['img'].shape[-2]
+        W = batch['img'].shape[-1]
+        background = torch.tensor([1.,1.,1.],requires_grad=False).cuda().float()
+        # import pdb;pdb.set_trace()
+        # gt_image = gt_image*gt_mask+(1.-gt_mask)*(background[None,...,None,None])
+        
+        # input_img = gt_image[None,...]* 2. - 1.
+        
+        # import pdb;pdb.set_trace()
+        with torch.no_grad():
+            batch_img = torch.tensor(batch['img'],requires_grad=False).cuda().squeeze().float()
+            batch_mask = torch.tensor(batch['mask'],requires_grad=False).cuda().squeeze().float()
+            batch_img = batch_img*batch_mask+(1-batch_mask)
+            img_input = torch.cat([torch.ones([3,420,1920],dtype=torch.float32,device=self.device),batch_img,torch.ones([3,420,1920],dtype=torch.float32,device=self.device)],dim=1)[None,...]
+            mask_input = torch.cat([torch.zeros([1,420,1920],dtype=torch.float32,device=self.device),batch_mask[None,...],torch.zeros([1,420,1920],dtype=torch.float32,device=self.device)],dim=1)[None,...]
+            # batch_sdf = torch.from_numpy(batch['sdf']).squeeze().cuda()
+            input_im = F.interpolate(img_input, (self.optim.ref_size, self.optim.ref_size), mode="bilinear", align_corners=False)
+            input_mask = F.interpolate(mask_input, (self.optim.ref_size, self.optim.ref_size), mode="bilinear", align_corners=False)
+            # get input embedding
+            # self.diffusion_model.clip_emb = self.diffusion_model.model.get_learned_conditioning(input_im.float()).tile(1,1,1).detach()
+            # self.diffusion_model.vae_emb = self.diffusion_model.model.encode_first_stage(input_im.float()).mode().detach()
+            # self.guidance_zero123.get_image_text_embeds(input_im, ["dog"], [self.neg_prompt])
+            c_list, v_list = [], []
+            c, v = self.guidance_zero123.get_img_embeds(input_im)
+            for _ in range(self.optim.batch_size):
+                c_list.append(c)
+                v_list.append(v)
+            if self.use_diffusion:
+                self.guidance_zero123.embeddings = [torch.cat(c_list, 0), torch.cat(v_list, 0)]
+            
+        n_steps = self.optim.iters
+        
+        self.warmup_step = 0
+        # import pdb;pdb.set_trace()
+        for i in tqdm(range(n_steps)):
+            # import pdb;pdb.set_trace()
+            self.warmup_step += 1
+            step_ratio = min(1, self.warmup_step / self.optim.iters)
+            self.gaussians.update_learning_rate(self.warmup_step)
+            loss = 0.
+            
+            rendered = self.main_render(rtk,(1920,1920),embedid,background=torch.tensor([1.,1.,1.],requires_grad=False).cuda().float(),canonical=True)
+            image = rendered['render']
+            mask = rendered['mask']
+            depth = rendered['depth']
+            image_loss = 10000 * step_ratio * F.mse_loss(image[None,...], img_input)
+            mask_loss = 1000 * step_ratio * F.mse_loss(mask[None,...], mask_input)
+            input_smooth_loss = 0.# 1000 * step_ratio * depth_smooth_loss(depth.squeeze())
+            loss += image_loss+mask_loss+input_smooth_loss
+            
+            render_resolution = 128 if step_ratio < 0.3 else (256 if step_ratio < 0.6 else 512)
+            images = []
+            poses = []
+            vers, hors, radii = [], [], []
+            min_ver = max(min(-30, -30 - gt_phi/np.pi*180.), -80 - gt_phi/np.pi*180.)
+            max_ver = min(max(30, 30 - gt_phi/np.pi*180.), 80 - gt_phi/np.pi*180.)
+            for _ in range(self.optim.batch_size):
+
+                # render random view
+                ver = np.random.randint(min_ver, max_ver)
+                hor = np.random.randint(-180, 180)
+                # radius = 0
+                radius = np.random.uniform(-0.5, 0.5) 
+
+                vers.append(ver)
+                hors.append(hor)
+                radii.append(radius)
+
+                pose = rtk_from_angles(hor/180.*np.pi+gt_theta,ver/180.*np.pi+gt_phi,render_resolution,self.camera_radius+radius)
+                poses.append(orbit_camera(ver+gt_phi/np.pi*180.,hor+gt_theta/np.pi*180.,render_resolution,self.camera_radius+radius))
+                # poses.append(pose)
+
+                # cur_cam = MiniCam(pose, render_resolution, render_resolution, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
+
+                bg_color = torch.tensor([1, 1, 1] if np.random.rand() > self.optim.invert_bg_prob else [0, 0, 0], dtype=torch.float32, device="cuda")
+                out = self.main_render(pose,(render_resolution,render_resolution),embedid,background=bg_color,canonical=True)
+                # out = self.renderer.render(cur_cam, bg_color=bg_color)
+
+                image = out["render"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
+                images.append(image)
+                
+                # if self.use_diffusion:
+                #     for view_i in range(1, 4):
+                #         pose = rtk_from_angles(hor/180.*np.pi+np.pi/2.*view_i+gt_theta+np.pi,ver/180.*np.pi+gt_phi,render_resolution,self.camera_radius+radius)
+                #         poses.append(orbit_camera(ver+gt_phi/np.pi*180.,hor+gt_theta/np.pi*180+view_i*90.,render_resolution,self.camera_radius+radius))
+                #         # pose_i = orbit_camera(self.opt.elevation + ver, hor + 90 * view_i, self.opt.radius + radius)
+                #         # poses.append(pose_i)
+
+                #         out = self.main_render(pose,(render_resolution,render_resolution),embedid,background=bg_color,canonical=False)
+
+                #         image = out["render"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
+                #         images.append(image)
+            images = torch.cat(images, dim=0)
+            poses = torch.from_numpy(np.stack(poses, axis=0)).to(self.device)
+                    
+            zero123_loss = self.optim.lambda_zero123 * self.guidance_zero123.train_step(images, vers, hors, radii, step_ratio) / self.optim.batch_size
+            # zero123_loss = self.optim.lambda_zero123 * self.guidance_zero123.train_step(images, poses, step_ratio=step_ratio)
+            loss += zero123_loss
+            loss.backward()
+            self.gaussians.optimizer.step()
+            self.gaussians.optimizer.zero_grad()
+            if self.warmup_step >= self.optim.density_start_iter and self.warmup_step <= self.optim.density_end_iter:
+                viewspace_point_tensor, visibility_filter, radii = out["viewspace_points"], out["visibility_filter"], out["radii"]
+                self.gaussians.max_radii2D[visibility_filter] = torch.max(self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                self.gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+
+                if self.warmup_step % self.optim.densification_interval == 0:
+                    # size_threshold = 20 if self.warmup_step > self.optim.opacity_reset_interval else None
+                    pnum = self.gaussians.densify_and_prune(self.optim.densify_grad_threshold, min_opacity=0.01, extent=0.2, max_screen_size=1)
+                
+                if self.warmup_step % self.optim.opacity_reset_interval == 0:
+                    self.gaussians.reset_opacity()
+            if i%100==0:
+                with torch.no_grad():
+                    self.save_imgs(save_dir,i,0,use_deform=False,novel_cam=True,save_img=False)
+            if i%10==0:
+                cv2.imwrite('test.png',images[0].squeeze().moveaxis(0,-1)[:,:,[2,1,0]].detach().cpu().numpy()*255.)
+                cv2.imwrite('origin.png',rendered['render'].squeeze().moveaxis(0,-1)[:,:,[2,1,0]].detach().cpu().numpy()*255.)
+        with torch.no_grad():
+            self.save_imgs(save_dir,n_steps,0,use_deform=False,novel_cam=True,save_img=False)
+                # import pdb;pdb.set_trace()
+            # if i == 5000:
+            #     self.gaussians.prune_points((self.gaussians.get_opacity <= 0.005).squeeze())
+            # torch.cuda.empty_cache()
+        # import pdb;pdb.set_trace()
+        
+        
+    
+    
+    def forward_default(self, batch, frame_bone=False):
         # import pdb;pdb.set_trace()
         opts = self.opts
         # get root poses
-        
+        step_ratio = 0.98
         
         
         rtk_all = self.compute_rts()
@@ -507,46 +752,159 @@ class banmo(nn.Module):
             rtk = self.compute_rts(batch['frameid'].to(self.device).long())[0]
         except:
             import pdb;pdb.set_trace()
-        # rtk = rtk_all[batch['frameid'].long()].squeeze()
         rtk = torch.cat([rtk,self.ks_param[batch['dataid'].to(self.device).long()]],dim=0)
-        # kaug= self.kaug
+        gt_theta, gt_phi = angles_from_rtk(rtk)
+        gt_theta = 0.
+        gt_phi = 0.
+        rtk = rtk_from_angles(gt_theta, gt_phi,radius = self.camera_radius)
         embedid=batch['frameid'].to(self.device)+self.data_offset[batch['dataid'].long()]
         H = batch['img'].shape[-2]
         W = batch['img'].shape[-1]
-        # aux_out={}
+        S = max(H,W)
         
+        use_flow = False
         # Render
-        background = torch.tensor([0.,0.,0.],requires_grad=False).cuda()
+        background = torch.tensor([1.,1.,1.],requires_grad=False).cuda()
         
-        rendered = self.main_render(rtk,(H,W),embedid,background=background,canonical=False)
+        # import pdb;pdb.set_trace()
+        if frame_bone:
+            rendered = self.bone_render(rtk,(S,S),embedid,background=background,canonical=False,render_xyz=use_flow,get_rigid_loss=True)
+        else:
+            rendered = self.main_render(rtk,(S,S),embedid,background=background,canonical=False,render_xyz=use_flow,get_rigid_loss=True)
+            
         aux_out = rendered
-        image = rendered['render']
-        mask = rendered['mask']
+        image = rendered['render'].squeeze()[:,420:-420]
+        mask = rendered['mask'].squeeze()[420:-420]
+        depth = rendered['depth'].squeeze()
         gt_image = batch['img'].squeeze().cuda().float()
         gt_mask = batch['mask'].squeeze().cuda().float()
+        gt_sdf = batch['sdf'].squeeze().cuda().float()
+        gt_flow = batch['flow'].squeeze().cuda().float()
+        # import pdb;pdb.set_trace()
+        
+        
         # import pdb;pdb.set_trace()
         gt_image = gt_image*gt_mask+(1.-gt_mask)*(background[...,None,None])
-        Ll1 = l1_loss(image*gt_mask, gt_image)
-        lambda_dssim = 0.2
+        img_input = torch.cat([torch.ones([3,420,1920],dtype=torch.float32,device=self.device),gt_image,torch.ones([3,420,1920],dtype=torch.float32,device=self.device)],dim=1)[None,...]
+        # Ll1 = l1_loss(image, gt_image)
+        # lambda_dssim = 0.2
         
         
-        # image loss
-        img_loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim((image)[None,...], (gt_image)[None,...]))
-        aux_out['img_loss'] = img_loss.data
-        total_loss = img_loss
-        
-        
-        # if img_loss.data < 0.01:
-        #     cv2.imwrite('test.png',(image.moveaxis(0,-1)*255.)[:,:,[2,1,0]].detach().cpu().numpy())
-        #     cv2.imwrite('origin.png',(gt_image.moveaxis(0,-1)*255.)[:,:,[2,1,0]].detach().cpu().numpy())
-        #     cv2.imwrite('mask.png',(mask.unsqueeze(-1)*255.)[:,:,[0,0,0]].detach().cpu().numpy())
-        
-        mask_loss = l1_loss(mask,gt_mask)
+        # # image loss
+        # import pdb;pdb.set_trace()
+        # img_loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim((image)[None,...], (gt_image)[None,...]))
+        img_weight = 1
         mask_weight = 0.1
+        lpips_weight = 0.1
+        rig_weight = 0.1
+        
+        img_loss = F.mse_loss(image[None,...], (gt_image)[None,...])
+        aux_out['img_loss'] = img_loss.data
+        
+        total_loss = img_loss*img_weight# * 10000  * step_ratio
+        
+        lpips_loss = self.lpips(image[None,...].clip(0.,1.), gt_image[None,...].clip(0.,1.))
+        # 1000. * step_ratio
+        total_loss += lpips_loss*lpips_weight
+        
+        #depth smooth loss
+        # input_smooth_loss = depth_smooth_loss(depth.squeeze())
+        # smooth_weight = 1000 * step_ratio
+        # total_loss += input_smooth_loss*smooth_weight
+        # aux_out['input_smooth_loss'] = input_smooth_loss.data
+        
+        # mask_loss = F.mse_loss(mask[None,...], gt_mask[None,...])
+        mask_loss = l1_loss(mask,gt_mask)
+        # mask_loss = sdf_loss(gt_mask,mask,gt_sdf)*0.1
+        # 1000  * step_ratio
         total_loss += mask_loss*mask_weight
         aux_out['mask_loss'] = mask_loss.data
         
+        if self.use_diffusion:
+            total_loss *=1
         
+        # rigid loss
+        rig_loss = rendered['rigid_loss']
+        
+        total_loss += rig_loss*rig_weight
+        # aux_out['rig_loss'] = rig_loss.data
+        # import pdb;pdb.set_trace()
+        
+            
+        # novel view diffusion preparing
+        rtk_novel = None
+        if self.use_diffusion:
+            with torch.no_grad():
+                # img_input = torch.cat([torch.ones([3,420,1920],dtype=torch.float32,device=self.device),gt_image,torch.ones([3,420,1920],dtype=torch.float32,device=self.device)],dim=1)[None,...]
+                input_im = F.interpolate(img_input, (self.optim.ref_size, self.optim.ref_size), mode="bilinear", align_corners=False)
+                c_list, v_list = [], []
+                c, v = self.guidance_zero123.get_img_embeds(input_im)
+                # import pdb;pdb.set_trace()
+                for _ in range(self.optim.batch_size_dynamic):
+                    c_list.append(c)
+                    v_list.append(v)
+                self.guidance_zero123.embeddings = [torch.cat(c_list, 0), torch.cat(v_list, 0)]
+        # diffusion loss
+        if self.use_diffusion:
+            images = []
+            poses = []
+            vers, hors, radii = [], [], []
+            min_ver = max(min(-30, -30 - gt_phi/np.pi*180.), -80 - gt_phi/np.pi*180.)
+            max_ver = min(max(30, 30 - gt_phi/np.pi*180.), 80 - gt_phi/np.pi*180.)
+            
+            render_resolution = 512
+            for _ in range(self.optim.batch_size_dynamic):
+
+                # render random view
+                ver = np.random.randint(min_ver, max_ver)
+                hor = np.random.randint(-180, 180)
+                # hor = -180
+                # radius = 0
+                radius = np.random.uniform(-0.5, 0.5) 
+
+                vers.append(ver)
+                hors.append(hor)
+                radii.append(radius)
+
+                pose = rtk_from_angles(hor/180.*np.pi+gt_theta,ver/180.*np.pi+gt_phi,render_resolution,self.camera_radius+radius)
+                poses.append(orbit_camera(ver/180.*np.pi+gt_phi,hor/180.*np.pi+gt_theta,render_resolution,self.camera_radius+radius))
+
+                # cur_cam = MiniCam(pose, render_resolution, render_resolution, self.cam.fovy, self.cam.fovx, self.cam.near, self.cam.far)
+
+                bg_color = torch.tensor([1, 1, 1] if np.random.rand() > self.optim.invert_bg_prob else [0, 0, 0], dtype=torch.float32, device="cuda")
+                if frame_bone:
+                    out = self.bone_render(pose,(render_resolution,render_resolution),embedid,background=bg_color,canonical=False)
+                else:
+                    out = self.main_render(pose,(render_resolution,render_resolution),embedid,background=bg_color,canonical=False)
+                # out = self.renderer.render(cur_cam, bg_color=bg_color)
+
+                image = out["render"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
+                if random.random() < 0.02:
+                    cv2.imwrite('test1.png',image.squeeze().moveaxis(0,-1)[:,:,[2,1,0]].detach().cpu().numpy()*255.)
+                images.append(image)
+                
+                # if self.use_diffusion:
+                #     for view_i in range(1, 4):
+                #         pose = rtk_from_angles(hor/180.*np.pi+np.pi/2.*view_i+gt_theta,ver/180.*np.pi+gt_phi,render_resolution,self.camera_radius+radius)
+                #         poses.append(orbit_camera(ver/180.*np.pi+gt_phi,hor/180.*np.pi+np.pi/2.*view_i+gt_theta,render_resolution,self.camera_radius+radius))
+                #         # pose_i = orbit_camera(self.opt.elevation + ver, hor + 90 * view_i, self.opt.radius + radius)
+                #         # poses.append(pose_i)
+
+                #         if frame_bone:
+                #             out = self.bone_render(pose,(render_resolution,render_resolution),embedid,background=bg_color,canonical=False)
+                #         else:
+                #             out = self.main_render(pose,(render_resolution,render_resolution),embedid,background=bg_color,canonical=False)
+
+                #         image = out["image"].unsqueeze(0) # [1, 3, H, W] in [0, 1]
+                #         images.append(image)
+                        
+                        
+            images = torch.cat(images, dim=0)
+            # poses = torch.stack(poses, axis=0).to(self.device)
+                    
+            zero123_loss = self.optim.lambda_zero123 * self.guidance_zero123.train_step(images, vers, hors, radii, step_ratio) / self.optim.batch_size_dynamic
+            aux_out['zero123_loss'] = zero123_loss
+            total_loss += zero123_loss/1000.
             
         # save some variables
         if opts.lbs:
@@ -554,25 +912,8 @@ class banmo(nn.Module):
             aux_out['skin_const'] = self.skin_aux[1].clone().detach()
 
         
-        # if opts.rm_novp:
-        #     img_loss = img_loss * rendered['sil_coarse'].detach()
-        # img_loss = img_loss[sil_at_samp[...,0]>0].mean() # eval on valid pts
-        # sil_loss_samp = opts.sil_wt*rendered['sil_loss_samp']
-        # sil_loss = sil_loss_samp[vis_at_samp>0].mean()
-        # aux_out['sil_loss'] = sil_loss
-        # aux_out['img_loss'] = img_loss
-        # total_loss = img_loss
-        # total_loss = total_loss + sil_loss 
           
-        # feat rnd loss
-        # frnd_loss_samp = opts.frnd_wt*rendered['frnd_loss_samp']
-        # if opts.loss_flt:
-        #     frnd_loss_samp[invalid_idx] *= 0
-        # if opts.rm_novp:
-        #     frnd_loss_samp = frnd_loss_samp * rendered['sil_coarse'].detach()
-        # feat_rnd_loss = frnd_loss_samp[sil_at_samp[...,0]>0].mean() # eval on valid pts
-        # aux_out['feat_rnd_loss'] = feat_rnd_loss
-        # total_loss = total_loss + feat_rnd_loss
+          
   
         # flow loss
         # if opts.use_corresp:
@@ -593,23 +934,27 @@ class banmo(nn.Module):
         #     aux_out['flo_loss'] = flo_loss
         
         
+        if opts.lbs and opts.bone_loc_reg>0 and not frame_bone:
+            bones_rst = self.bones
+            bones_rst,_ = correct_bones(self, bones_rst)
+            inds = np.random.choice(range(self.gaussians._xyz.shape[0]),size=(1000,),replace=False)
+            shape_samp = self.gaussians._xyz[inds].detach()
+            
+            # shape_samp = shape_samp[0].to(self.device)
+            from geomloss import SamplesLoss
+            samploss = SamplesLoss(loss="sinkhorn", p=2, blur=.05)
+            bone_loc_loss = samploss(bones_rst[:,:3]*10, shape_samp*10)
+            bone_loc_loss = opts.bone_loc_reg*bone_loc_loss
+            total_loss = total_loss + bone_loc_loss
+            aux_out['bone_loc_loss'] = bone_loc_loss
+
+
+        #     # elastic energy for se3 field / translation field
+        #     if 'elastic_loss' in rendered.keys():
+        #         elastic_loss = rendered['elastic_loss'].mean() * 1e-3
+        #         total_loss = total_loss + elastic_loss
+        #         aux_out['elastic_loss'] = elastic_loss
         
-        # # regularization 
-        # if 'frame_cyc_dis' in rendered.keys():
-        #     # cycle loss
-        #     cyc_loss = rendered['frame_cyc_dis'].mean()
-        #     total_loss = total_loss + cyc_loss * opts.cyc_wt
-        #     #total_loss = total_loss + cyc_loss*0
-        #     aux_out['cyc_loss'] = cyc_loss
-
-        #     # globally rigid prior
-        #     rig_loss = 0.0001*rendered['frame_rigloss'].mean()
-        #     if opts.rig_loss:
-        #         total_loss = total_loss + rig_loss
-        #     else:
-        #         total_loss = total_loss + rig_loss*0
-        #     aux_out['rig_loss'] = rig_loss
-
         #     # elastic energy for se3 field / translation field
         #     if 'elastic_loss' in rendered.keys():
         #         elastic_loss = rendered['elastic_loss'].mean() * 1e-3
@@ -617,22 +962,24 @@ class banmo(nn.Module):
         #         aux_out['elastic_loss'] = elastic_loss
 
         # regularization of root poses
-        if opts.root_sm:
-            # root_sm_loss_1st = compute_root_sm_loss(rtk_all, self.data_offset)
-            root_sm_loss_2nd = compute_root_sm_2nd_loss(rtk_all, self.data_offset)
-            # aux_out['root_sm_1st_loss'] = root_sm_loss_1st
-            aux_out['root_sm_2nd_loss'] = root_sm_loss_2nd
-            total_loss = total_loss + root_sm_loss_2nd
+        # if opts.root_sm:
+        #     # root_sm_loss_1st = compute_root_sm_loss(rtk_all, self.data_offset)
+        #     root_sm_loss_2nd = compute_root_sm_2nd_loss(rtk_all, self.data_offset)
+        #     # aux_out['root_sm_1st_loss'] = root_sm_loss_1st
+        #     aux_out['root_sm_2nd_loss'] = root_sm_loss_2nd
+        #     total_loss = total_loss + root_sm_loss_2nd
 
 
-        # if opts.eikonal_wt > 0:
-        #     ekl_loss = opts.eikonal_wt * eikonal_loss(self.nerf_coarse, self.embedding_xyz, 
-        #                 rendered['xyz_canonical_vis'], self.latest_vars['obj_bound'])
-        #     aux_out['ekl_loss'] = ekl_loss
-        #     total_loss = total_loss + ekl_loss
-            
 
-
+        
+        
+        # total_loss = total_loss * opts.total_wt
+        # aux_out['total_loss'] = total_loss
+        # aux_out['beta'] = self.nerf_coarse.beta.clone().detach()[0]
+        # if opts.debug:
+        #     torch.cuda.synchronize()
+        #     print('set input + render + loss time:%.2f'%(time.time()-start_time))
+        
         
         
         # total_loss = total_loss * opts.total_wt
@@ -644,190 +991,18 @@ class banmo(nn.Module):
         return total_loss, aux_out
 
 
-    def forward_warmup_rootmlp(self, batch):
-        """
-        batch variable is not never being used here
-        """
-        # render ground-truth data
-        opts = self.opts
-        device = self.device
-        
-        # loss
-        aux_out={}
-        self.rtk = torch.zeros(self.num_fr,4,4).to(device)
-        self.frameid = torch.Tensor(range(self.num_fr)).to(device)
-        self.dataid,_ = fid_reindex(self.frameid, self.num_vid, self.data_offset)
-        self.convert_root_pose()
-
-        rtk_gt = torch.Tensor(self.latest_vars['rtk']).to(device)
-        _ = rtk_loss(self.rtk, rtk_gt, aux_out)
-        root_sm_loss =  compute_root_sm_2nd_loss(self.rtk, self.data_offset)
-        
-        total_loss = 0.1*aux_out['rot_loss'] + 0.01*root_sm_loss
-        aux_out['warmup_root_sm_loss'] = root_sm_loss
-        del aux_out['trn_loss']
-
-        return total_loss, aux_out
-    
-    def forward_warmup_shape(self, batch):
-        """
-        batch variable is not never being used here
-        """
-        # render ground-truth data
-        opts = self.opts
-        
-        # loss
-        shape_factor = 0.1
-        aux_out={}
-        total_loss = shape_init_loss(self.dp_verts_unit*shape_factor,self.dp_faces, \
-                              self.nerf_coarse, self.embedding_xyz, 
-            bound_factor=opts.bound_factor * 1.2, use_ellips=opts.init_ellips)
-        aux_out['shape_init_loss'] = total_loss
-
-        return total_loss, aux_out
-
-    def forward_warmup(self, batch):
-        """
-        batch variable is not never being used here
-        """
-        # render ground-truth data
-        opts = self.opts
-        bs_rd = 16
-        with torch.no_grad():
-            vertex_color = self.dp_embed
-            dp_feats_rd, rtk_raw = self.render_dp(self.dp_verts_unit, 
-                    self.dp_faces, vertex_color, self.near_far, self.device, 
-                    self.mesh_renderer, bs_rd)
-
-        aux_out={}
-        # predict delta se3
-        root_rts = self.nerf_root_rts(dp_feats_rd)
-        root_rmat = root_rts[:,0,:9].view(-1,3,3)
-        root_tmat = root_rts[:,0,9:12]    
-
-        # construct base se3
-        rtk = torch.zeros(bs_rd, 4,4).to(self.device)
-        rtk[:,:3] = self.create_base_se3(bs_rd, self.device)
-
-        # compose se3
-        rmat = rtk[:,:3,:3]
-        tmat = rtk[:,:3,3]
-        tmat = tmat + rmat.matmul(root_tmat[...,None])[...,0]
-        rmat = rmat.matmul(root_rmat)
-        rtk[:,:3,:3] = rmat
-        rtk[:,:3,3] = tmat.detach() # do not train translation
-        
-        # loss
-        total_loss = rtk_loss(rtk, rtk_raw, aux_out)
-
-        aux_out['total_loss'] = total_loss
-
-        return total_loss, aux_out
     
     
-    
-    @staticmethod
-    def render_dp(dp_verts_unit, dp_faces, dp_embed, near_far, device, 
-                  mesh_renderer, bs):
-        """
-        render a pair of (densepose feature bsx16x112x112, se3)
-        input is densepose surface model and near-far plane
-        """
-        verts = dp_verts_unit
-        faces = dp_faces
-        dp_embed = dp_embed
-        num_verts, embed_dim = dp_embed.shape
-        img_size = 256
-        crop_size = 112
-        focal = 2
-        std_rot = 6.28 # rotation std
-        std_dep = 0.5 # depth std
-
-
-        # scale geometry and translation based on near-far plane
-        d_mean = near_far.mean()
-        verts = verts / 3 * d_mean # scale based on mean depth
-        dep_rand = 1 + np.random.normal(0,std_dep,bs)
-        dep_rand = torch.Tensor(dep_rand).to(device)
-        d_obj = d_mean * dep_rand
-        d_obj = torch.max(d_obj, 1.2*1/3 * d_mean)
-        
-        # set cameras
-        rot_rand = np.random.normal(0,std_rot,(bs,3))
-        rot_rand = torch.Tensor(rot_rand).to(device)
-        Rmat = transforms.axis_angle_to_matrix(rot_rand)
-        Tmat = torch.cat([torch.zeros(bs, 2).to(device), d_obj[:,None]],-1)
-        K =    torch.Tensor([[focal,focal,0,0]]).to(device).repeat(bs,1)
-        
-        # add RTK: [R_3x3|T_3x1]
-        #          [fx,fy,px,py], to the ndc space
-        Kimg = torch.Tensor([[focal*img_size/2.,focal*img_size/2.,img_size/2.,
-                            img_size/2.]]).to(device).repeat(bs,1)
-        rtk = torch.zeros(bs,4,4).to(device)
-        rtk[:,:3,:3] = Rmat
-        rtk[:,:3, 3] = Tmat
-        rtk[:,3, :]  = Kimg
-
-        # repeat mesh
-        verts = verts[None].repeat(bs,1,1)
-        faces = faces[None].repeat(bs,1,1)
-        dp_embed = dp_embed[None].repeat(bs,1,1)
-
-        # obj-cam transform 
-        verts = obj_to_cam(verts, Rmat, Tmat)
-        
-        # pespective projection
-        verts = pinhole_cam(verts, K)
-        
-        # render sil+rgb
-        rendered = []
-        for i in range(0,embed_dim,3):
-            dp_chunk = dp_embed[...,i:i+3]
-            dp_chunk_size = dp_chunk.shape[-1]
-            if dp_chunk_size<3:
-                dp_chunk = torch.cat([dp_chunk,
-                    dp_embed[...,:(3-dp_chunk_size)]],-1)
-            rendered_chunk = render_color(mesh_renderer, verts, faces, 
-                    dp_chunk,  texture_type='vertex')
-            rendered_chunk = rendered_chunk[:,:3]
-            rendered.append(rendered_chunk)
-        rendered = torch.cat(rendered, 1)
-        rendered = rendered[:,:embed_dim]
-
-        # resize to bounding box
-        rendered_crops = []
-        for i in range(bs):
-            mask = rendered[i].max(0)[0]>0
-            mask = mask.cpu().numpy()
-            indices = np.where(mask>0); xid = indices[1]; yid = indices[0]
-            center = ( (xid.max()+xid.min())//2, (yid.max()+yid.min())//2)
-            length = ( int((xid.max()-xid.min())*1.//2 ), 
-                      int((yid.max()-yid.min())*1.//2  ))
-            left,top,w,h = [center[0]-length[0], center[1]-length[1],
-                    length[0]*2, length[1]*2]
-            rendered_crop = torchvision.transforms.functional.resized_crop(\
-                    rendered[i], top,left,h,w,(50,50))
-            # mask augmentation
-            rendered_crop = mask_aug(rendered_crop)
-
-            rendered_crops.append( rendered_crop)
-            #cv2.imwrite('%d.png'%i, rendered_crop.std(0).cpu().numpy()*1000)
-
-        rendered_crops = torch.stack(rendered_crops,0)
-        rendered_crops = F.interpolate(rendered_crops, (crop_size, crop_size), 
-                mode='bilinear')
-        rendered_crops = F.normalize(rendered_crops, 2,1)
-        return rendered_crops, rtk
 
     @staticmethod
-    def create_base_se3(bs, device):
+    def create_base_se3(bs, device, radius=1.0):
         """
         create a base se3 based on near-far plane
         """
         rt = torch.zeros(bs,3,4).to(device)
         rt[:,:3,:3] = torch.eye(3)[None].repeat(bs,1,1).to(device)
         rt[:,:2,3] = 0.
-        rt[:,2,3] = 0.3
+        rt[:,2,3] = radius
         return rt
 
     @staticmethod
@@ -843,223 +1018,6 @@ class banmo(nn.Module):
         Kinv = Kmatinv(Kaug.matmul(Kmat))
         return Rmat, Tmat, Kinv
 
-    def sample_pxs(self, bs, nsample, Rmat, Tmat, Kinv,
-                   dataid, frameid, frameid_sub, embedid, lineid,errid,
-                   imgs, masks, vis2d, flow, occ, dp_feats):
-        """
-        make sure self. is not modified
-        xys:    bs, nsample, 2
-        rand_inds: bs, nsample
-        """
-        opts = self.opts
-        Kinv_in=Kinv.clone()
-        dataid_in=dataid.clone()
-        frameid_sub_in = frameid_sub.clone()
-        
-        # sample 1x points, sample 4x points for further selection
-        nsample_a = 4*nsample
-        rand_inds, xys = sample_xy(self.img_size, bs, nsample+nsample_a, self.device,
-                               return_all= not(self.training), lineid=lineid)
-
-        if self.training and opts.use_unc and \
-                self.progress >= (opts.warmup_steps):
-            is_active=True
-            nsample_s = int(opts.nactive * nsample)  # active 
-            nsample   = int(nsample*(1-opts.nactive)) # uniform
-        else:
-            is_active=False
-
-        if self.training:
-            rand_inds_a, xys_a = rand_inds[:,-nsample_a:].clone(), xys[:,-nsample_a:].clone()
-            rand_inds, xys     = rand_inds[:,:nsample].clone(), xys[:,:nsample].clone()
-
-            if opts.lineload:
-                # expand frameid, Rmat,Tmat, Kinv
-                frameid_a=        frameid[:,None].repeat(1,nsample_a)
-                frameid_sub_a=frameid_sub[:,None].repeat(1,nsample_a)
-                dataid_a=          dataid[:,None].repeat(1,nsample_a)
-                errid_a=            errid[:,None].repeat(1,nsample_a)
-                Rmat_a = Rmat[:,None].repeat(1,nsample_a,1,1)
-                Tmat_a = Tmat[:,None].repeat(1,nsample_a,1)
-                Kinv_a = Kinv[:,None].repeat(1,nsample_a,1,1)
-                # expand         
-                frameid =         frameid[:,None].repeat(1,nsample)
-                frameid_sub = frameid_sub[:,None].repeat(1,nsample)
-                dataid =           dataid[:,None].repeat(1,nsample)
-                errid =             errid[:,None].repeat(1,nsample)
-                Rmat = Rmat[:,None].repeat(1,nsample,1,1)
-                Tmat = Tmat[:,None].repeat(1,nsample,1)
-                Kinv = Kinv[:,None].repeat(1,nsample,1,1)
-
-                batch_map   = torch.Tensor(range(bs)).to(self.device)[:,None].long()
-                batch_map_a = batch_map.repeat(1,nsample_a)
-                batch_map   = batch_map.repeat(1,nsample)
-
-        # importance sampling
-        if is_active:
-            with torch.no_grad():
-                # run uncertainty estimation
-                ts = frameid_sub_in.to(self.device) / self.max_ts * 2 -1
-                ts = ts[:,None,None].repeat(1,nsample_a,1)
-                dataid_in = dataid_in.long().to(self.device)
-                vid_code = self.vid_code(dataid_in)[:,None].repeat(1,nsample_a,1)
-
-                # convert to normalized coords
-                xysn = torch.cat([xys_a, torch.ones_like(xys_a[...,:1])],2)
-                xysn = xysn.matmul(Kinv_in.permute(0,2,1))[...,:2]
-
-                xyt = torch.cat([xysn, ts],-1)
-                xyt_embedded = self.embedding_xyz(xyt)
-                xyt_code = torch.cat([xyt_embedded, vid_code],-1)
-                unc_pred = self.nerf_unc(xyt_code)[...,0]
-
-            # preprocess to format 2,bs,w
-            if opts.lineload:
-                unc_pred = unc_pred.view(2,-1)
-                xys =     xys.view(2,-1,2)
-                xys_a = xys_a.view(2,-1,2)
-                rand_inds =     rand_inds.view(2,-1)
-                rand_inds_a = rand_inds_a.view(2,-1)
-                frameid   =   frameid.view(2,-1)
-                frameid_a = frameid_a.view(2,-1)
-                frameid_sub   =   frameid_sub.view(2,-1)
-                frameid_sub_a = frameid_sub_a.view(2,-1)
-                dataid   =   dataid.view(2,-1)
-                dataid_a = dataid_a.view(2,-1)
-                errid   =     errid.view(2,-1)
-                errid_a   = errid_a.view(2,-1)
-                batch_map   =   batch_map.view(2,-1)
-                batch_map_a = batch_map_a.view(2,-1)
-                Rmat   =   Rmat.view(2,-1,3,3)
-                Rmat_a = Rmat_a.view(2,-1,3,3)
-                Tmat   =   Tmat.view(2,-1,3)
-                Tmat_a = Tmat_a.view(2,-1,3)
-                Kinv   =   Kinv.view(2,-1,3,3)
-                Kinv_a = Kinv_a.view(2,-1,3,3)
-
-                nsample_s = nsample_s * bs//2
-                bs=2
-
-                # merge top nsamples
-                topk_samp = unc_pred.topk(nsample_s,dim=-1)[1] # bs,nsamp
-                
-                # use the first imgs (in a pair) sampled index
-                xys_a =       torch.stack(          [xys_a[i][topk_samp[0]] for i in range(bs)],0)
-                rand_inds_a = torch.stack(    [rand_inds_a[i][topk_samp[0]] for i in range(bs)],0)
-                frameid_a =       torch.stack(  [frameid_a[i][topk_samp[0]] for i in range(bs)],0)
-                frameid_sub_a=torch.stack(  [frameid_sub_a[i][topk_samp[0]] for i in range(bs)],0)
-                dataid_a =         torch.stack(  [dataid_a[i][topk_samp[0]] for i in range(bs)],0)
-                errid_a =           torch.stack(  [errid_a[i][topk_samp[0]] for i in range(bs)],0)
-                batch_map_a =   torch.stack(  [batch_map_a[i][topk_samp[0]] for i in range(bs)],0)
-                Rmat_a =             torch.stack(  [Rmat_a[i][topk_samp[0]] for i in range(bs)],0)
-                Tmat_a =             torch.stack(  [Tmat_a[i][topk_samp[0]] for i in range(bs)],0)
-                Kinv_a =             torch.stack(  [Kinv_a[i][topk_samp[0]] for i in range(bs)],0)
-
-                xys =       torch.cat([xys,xys_a],1)
-                rand_inds = torch.cat([rand_inds,rand_inds_a],1)
-                frameid =   torch.cat([frameid,frameid_a],1)
-                frameid_sub=torch.cat([frameid_sub,frameid_sub_a],1)
-                dataid =    torch.cat([dataid,dataid_a],1)
-                errid =     torch.cat([errid,errid_a],1)
-                batch_map = torch.cat([batch_map,batch_map_a],1)
-                Rmat =      torch.cat([Rmat,Rmat_a],1)
-                Tmat =      torch.cat([Tmat,Tmat_a],1)
-                Kinv =      torch.cat([Kinv,Kinv_a],1)
-            else:
-                topk_samp = unc_pred.topk(nsample_s,dim=-1)[1] # bs,nsamp
-                
-                xys_a =       torch.stack(      [xys_a[i][topk_samp[i]] for i in range(bs)],0)
-                rand_inds_a = torch.stack([rand_inds_a[i][topk_samp[i]] for i in range(bs)],0)
-                
-                xys =       torch.cat([xys,xys_a],1)
-                rand_inds = torch.cat([rand_inds,rand_inds_a],1)
-        
-
-        # for line: reshape to 2*bs, 1,...
-        if self.training and opts.lineload:
-            frameid =         frameid.view(-1)
-            frameid_sub = frameid_sub.view(-1)
-            dataid =           dataid.view(-1)
-            errid =             errid.view(-1)
-            batch_map =     batch_map.view(-1)
-            xys =           xys.view(-1,1,2)
-            rand_inds = rand_inds.view(-1,1)
-            Rmat = Rmat.view(-1,3,3)
-            Tmat = Tmat.view(-1,3)
-            Kinv = Kinv.view(-1,3,3)
-
-        near_far = self.near_far[frameid.long()]
-        rays = raycast(xys, Rmat, Tmat, Kinv, near_far)
-       
-        # need to reshape dataid, frameid_sub, embedid #TODO embedid equiv to frameid
-        self.update_rays(rays, bs>1, dataid, frameid_sub, frameid, xys, Kinv)
-        
-        if 'bones' in self.networks.keys():
-            # update delta rts fw
-            self.update_delta_rts(rays)
-        
-        # for line: 2bs*nsamp,1
-        # for batch:2bs,nsamp
-        #TODO reshape imgs, masks, etc.
-        if self.training and opts.lineload:
-            self.obs_to_rays_line(rays, rand_inds, imgs, masks, vis2d, flow, occ, 
-                    dp_feats, batch_map)
-        else:
-            self.obs_to_rays(rays, rand_inds, imgs, masks, vis2d, flow, occ, dp_feats)
-
-        # TODO visualize samples
-        #pdb.set_trace()
-        #self.imgs_samp = []
-        #for i in range(bs):
-        #    self.imgs_samp.append(draw_pts(self.imgs[i], xys_a[i]))
-        #self.imgs_samp = torch.stack(self.imgs_samp,0)
-
-        return rand_inds, rays, frameid, errid
-    
-    def obs_to_rays_line(self, rays, rand_inds, imgs, masks, vis2d,
-            flow, occ, dp_feats,batch_map):
-        """
-        convert imgs, masks, flow, occ, dp_feats to rays
-        rand_map: map pixel index to original batch index
-        rand_inds: bs, 
-        """
-        opts = self.opts
-        rays['img_at_samp']=torch.gather(imgs[batch_map][...,0], 2, 
-                rand_inds[:,None].repeat(1,3,1))[:,None][...,0]
-        rays['sil_at_samp']=torch.gather(masks[batch_map][...,0], 2, 
-                rand_inds[:,None].repeat(1,1,1))[:,None][...,0]
-        rays['vis_at_samp']=torch.gather(vis2d[batch_map][...,0], 2, 
-                rand_inds[:,None].repeat(1,1,1))[:,None][...,0]
-        rays['flo_at_samp']=torch.gather(flow[batch_map][...,0], 2, 
-                rand_inds[:,None].repeat(1,2,1))[:,None][...,0]
-        rays['cfd_at_samp']=torch.gather(occ[batch_map][...,0], 2, 
-                rand_inds[:,None].repeat(1,1,1))[:,None][...,0]
-        if opts.use_embed:
-            rays['feats_at_samp']=torch.gather(dp_feats[batch_map][...,0], 2, 
-                rand_inds[:,None].repeat(1,16,1))[:,None][...,0]
-     
-    def obs_to_rays(self, rays, rand_inds, imgs, masks, vis2d,
-            flow, occ, dp_feats):
-        """
-        convert imgs, masks, flow, occ, dp_feats to rays
-        """
-        opts = self.opts
-        bs = imgs.shape[0]
-        rays['img_at_samp'] = torch.stack([imgs[i].view(3,-1).T[rand_inds[i]]\
-                                for i in range(bs)],0) # bs,ns,3
-        rays['sil_at_samp'] = torch.stack([masks[i].view(-1,1)[rand_inds[i]]\
-                                for i in range(bs)],0) # bs,ns,1
-        rays['vis_at_samp'] = torch.stack([vis2d[i].view(-1,1)[rand_inds[i]]\
-                                for i in range(bs)],0) # bs,ns,1
-        rays['flo_at_samp'] = torch.stack([flow[i].view(2,-1).T[rand_inds[i]]\
-                                for i in range(bs)],0) # bs,ns,2
-        rays['cfd_at_samp'] = torch.stack([occ[i].view(-1,1)[rand_inds[i]]\
-                                for i in range(bs)],0) # bs,ns,1
-        if opts.use_embed:
-            feats_at_samp = [dp_feats[i].view(16,-1).T\
-                             [rand_inds[i].long()] for i in range(bs)]
-            feats_at_samp = torch.stack(feats_at_samp,0) # bs,ns,num_feat
-            rays['feats_at_samp'] = feats_at_samp
         
     def update_delta_rts(self, rays):
         """
@@ -1080,84 +1038,6 @@ class banmo(nn.Module):
             rays['bone_rts_dentrg'] = correct_rest_pose(opts, 
                                             rays['bone_rts_dentrg'], bone_rts_rst)
 
-    def update_rays(self, rays, is_pair, dataid, frameid_sub, embedid, xys, Kinv):
-        """
-        """
-        opts = self.opts
-        # append target frame rtk
-        embedid = embedid.long().to(self.device)
-        if is_pair:
-            rtk_vec = rays['rtk_vec'] # bs, N, 21
-            rtk_vec_target = rtk_vec.view(2,-1).flip(0)
-            rays['rtk_vec_target'] = rtk_vec_target.reshape(rays['rtk_vec'].shape)
-            
-            embedid_target = embedid.view(2,-1).flip(0).reshape(-1)
-            if opts.flowbw:
-                time_embedded_target = self.pose_code(embedid_target)[:,None]
-                rays['time_embedded_target'] = time_embedded_target.repeat(1,
-                                                            rays['nsample'],1)
-            elif opts.lbs and self.num_bone_used>0:
-                bone_rts_target = self.nerf_body_rts(embedid_target)
-                rays['bone_rts_target'] = bone_rts_target.repeat(1,rays['nsample'],1)
-
-        # pass time-dependent inputs
-        time_embedded = self.pose_code(embedid)[:,None]
-        rays['time_embedded'] = time_embedded.repeat(1,rays['nsample'],1)
-        if opts.lbs and self.num_bone_used>0:
-            bone_rts = self.nerf_body_rts(embedid)
-            rays['bone_rts'] = bone_rts.repeat(1,rays['nsample'],1)
-
-        if opts.env_code:
-            rays['env_code'] = self.env_code(embedid)[:,None]
-            rays['env_code'] = rays['env_code'].repeat(1,rays['nsample'],1)
-            #rays['env_code'] = self.env_code(dataid.long().to(self.device))
-            #rays['env_code'] = rays['env_code'][:,None].repeat(1,rays['nsample'],1)
-
-        if opts.use_unc:
-            ts = frameid_sub.to(self.device) / self.max_ts * 2 -1
-            ts = ts[:,None,None].repeat(1,rays['nsample'],1)
-            rays['ts'] = ts
-        
-            dataid = dataid.long().to(self.device)
-            vid_code = self.vid_code(dataid)[:,None].repeat(1,rays['nsample'],1)
-            rays['vid_code'] = vid_code
-            
-            xysn = torch.cat([xys, torch.ones_like(xys[...,:1])],2)
-            xysn = xysn.matmul(Kinv.permute(0,2,1))[...,:2]
-            rays['xysn'] = xysn
-
-    def convert_line_input(self, batch):
-        device = self.device
-        opts = self.opts
-        # convert to float
-        for k,v in batch.items():
-            batch[k] = batch[k].float()
-
-        bs=batch['dataid'].shape[0]
-
-        self.imgs         = batch['img']         .view(bs,2,3, -1).permute(1,0,2,3).reshape(bs*2,3, -1,1).to(device)
-        self.masks        = batch['mask']        .view(bs,2,1, -1).permute(1,0,2,3).reshape(bs*2,1, -1,1).to(device)
-        self.vis2d        = batch['vis2d']       .view(bs,2,1, -1).permute(1,0,2,3).reshape(bs*2,1, -1,1).to(device)
-        self.flow         = batch['flow']        .view(bs,2,2, -1).permute(1,0,2,3).reshape(bs*2,2, -1,1).to(device)
-        self.occ          = batch['occ']         .view(bs,2,1, -1).permute(1,0,2,3).reshape(bs*2,1, -1,1).to(device)
-        self.dps          = batch['dp']          .view(bs,2,1, -1).permute(1,0,2,3).reshape(bs*2,1, -1,1).to(device)
-        self.dp_feats     = batch['dp_feat_rsmp'].view(bs,2,16,-1).permute(1,0,2,3).reshape(bs*2,16,-1,1).to(device)
-        self.dp_feats     = F.normalize(self.dp_feats, 2,1)
-        self.rtk          = batch['rtk']         .view(bs,-1,4,4).permute(1,0,2,3).reshape(-1,4,4)    .to(device)
-        self.kaug         = batch['kaug']        .view(bs,-1,4).permute(1,0,2).reshape(-1,4)          .to(device)
-        self.frameid      = batch['frameid']     .view(bs,-1).permute(1,0).reshape(-1).cpu()
-        self.dataid       = batch['dataid']      .view(bs,-1).permute(1,0).reshape(-1).cpu()
-        self.lineid       = batch['lineid']      .view(bs,-1).permute(1,0).reshape(-1).to(device)
-      
-        self.frameid_sub = self.frameid.clone() # id within a video
-        self.embedid = self.frameid + self.data_offset[self.dataid.long()]
-        self.frameid = self.frameid + self.data_offset[self.dataid.long()]
-        self.errid = self.frameid*opts.img_size + self.lineid.cpu() # for err filter
-        self.rt_raw  = self.rtk.clone()[:,:3]
-
-        # process silhouette
-        self.masks = (self.masks*self.vis2d)>0
-        self.masks = self.masks.float()
 
     def convert_batch_input(self, batch):
         device = self.device
@@ -1311,7 +1191,7 @@ class banmo(nn.Module):
             rt_raw = torch.Tensor(self.latest_vars['rt_raw']).to(device)
             rt_raw[:,:3,3] = rt_raw[:,:3,3] / self.obj_scale
         else:
-            rt_raw = self.create_base_se3(frameid.shape[0], device)
+            rt_raw = self.create_base_se3(frameid.shape[0], device, self.camera_radius)
         
         # compute mlp rts
         if opts.root_opt:
@@ -1354,23 +1234,12 @@ class banmo(nn.Module):
       
         self.save_latest_vars()
         
-        # if opts.lineload and self.training:
-        #     self.dp_feats = self.dp_feats
-        # else:
-        #     self.dp_feats = resample_dp(self.dp_feats, 
-        #             self.dp_bbox, self.kaug, self.img_size)
-        
-        # if self.training and self.opts.anneal_freq:
-        #     alpha = self.num_freqs * \
-        #         self.progress / (opts.warmup_steps)
-        #     #if alpha>self.alpha.data[0]:
-        #     self.alpha.data[0] = min(max(6, alpha),self.num_freqs) # alpha from 6 to 10
-        #     self.embedding_xyz.alpha = self.alpha.data[0]
-        #     self.embedding_dir.alpha = self.alpha.data[0]
 
         return bs
 
-    def save_imgs(self,savedir,epoch,vid=5,use_deform=True,novel_cam=False,fixed_cam=False,save_img=True,save_video=True):
+    def save_imgs(self,savedir,epoch,vid=5,use_deform=True,novel_cam=False,fixed_cam=False,
+                  save_img=True,save_video=True,random_color=False,bone_color=False,fixed_frame=-1,
+                  frame_bone=False,camera_axis=np.pi,fai=0.,ease_rot=False,postfix='',rp=False,seqname=''):
         if vid ==-1: vid=5
         opts = self.opts
         rtks = self.compute_rts()[self.data_offset[vid]:self.data_offset[vid+1],:,:].cuda()
@@ -1383,51 +1252,111 @@ class banmo(nn.Module):
         # embedid = torch.Tensor(sample_idx).to(self.device).long() + \
         #         self.data_offset[vid]
         rgbs = []
+        masks = []
+        others = []
         prefix = 'origin'
         if novel_cam:
             prefix = 'novel'
         if fixed_cam:
             prefix = 'fix'
+        if random_color:
+            prefix=prefix+'_random'
+        if bone_color:
+            prefix=prefix+'_bone'
+        prefix = prefix+postfix
         #import pdb;pdb.set_trace()
-        target = [0,10,20,30,40,50,60,70]
-        H=1080
+        # target = [random.randint(0,bs-1) for i in range(5)]
+        H=1920
         W=1920
-        if save_video:
-            target = range(bs)
-        for i in tqdm(target):
-            rtk = torch.cat([rtks[i],self.ks_param[vid][None,...]],dim=0)
+        if random_color:
+            self.color_replace = torch.rand_like(self.gaussians._xyz).cuda()
+        else:
+            self.color_replace = None
+        
+        
+        frames = {'camel':(0,25),'bailang':(8,31),'zongxiong':(0,bs),'snail':(0,bs),'penguin_n':(0,bs),'littlelion':(5,bs)}
+        target = list(range(bs))
+        # print(target)
+        rotate_num = 2
+        final_angle = 2*np.pi
+        if rp:
+            a,b = frames[seqname]
+            target = list(range(a,b))
+            target = target*10
+            target = target[:80]
+            final_angle = final_angle*rotate_num
+        for i in tqdm(range(len(target))):
+            rtk = torch.cat([rtks[target[i]],self.ks_param[vid][None,...]],dim=0)
+            cam_r = self.camera_radius
+            gt_theta, gt_phi = angles_from_rtk(rtk)
+            gt_theta = 0.
+            gt_phi=0.
+            rtk = rtk_from_angles(gt_theta, gt_phi,radius = cam_r)
             Rmat = rtk[:3,:3]
             Tmat = rtk[:3,3]
             K = rtk[3,:]
-            cam_r = 0.5
+            
             if fixed_cam:
-                angle = 0.
-                Rmat = torch.inverse(torch.tensor([[np.sin(angle),0.,np.cos(angle)],
-                                        [0.,-1.,0.],
-                                        [-np.cos(angle),0.,np.sin(angle)]]))
+                angle = camera_axis
+                
+                Rmat = torch.tensor([[-np.sin(angle),0.,-np.cos(angle)],
+                                        [-np.cos(angle)*np.sin(fai),-np.cos(fai),np.sin(angle)*np.sin(fai)],    
+                                        [-np.cos(angle)*np.cos(fai),np.sin(fai),np.sin(angle)*np.cos(fai)]])
                 Tmat = torch.tensor([0.,0.,1.])*cam_r
-                K = torch.tensor([[1024.,1024.,256.,256.]])
+                # Rmat = torch.inverse(torch.tensor([[-np.sin(angle),0.,-np.cos(angle)],
+                #                         [0.,-1.,0.],
+                #                         [-np.cos(angle),0.,np.sin(angle)]]))
+                # Tmat = torch.tensor([0.,0.,1.])*cam_r
+                K = torch.tensor([512.,512.,256.,256.])
                 H=W=512
             
             if novel_cam:
-                angle = np.pi*2*i/bs
-                Rmat = torch.inverse(torch.tensor([[np.sin(angle),0.,np.cos(angle)],
-                                        [0.,-1.,0.],
-                                        [-np.cos(angle),0.,np.sin(angle)]]))
+                angle = final_angle*i/len(target)
+                if ease_rot:
+                    angle /= 6.
+                
+                Rmat = torch.tensor([[-np.sin(angle),0.,-np.cos(angle)],
+                                        [-np.cos(angle)*np.sin(fai),-np.cos(fai),np.sin(angle)*np.sin(fai)],    
+                                        [-np.cos(angle)*np.cos(fai),np.sin(fai),np.sin(angle)*np.cos(fai)]])
                 Tmat = torch.tensor([0.,0.,1.])*cam_r
-                K = torch.tensor([1024.,1024.,256.,256.])
+                # Rmat = torch.inverse(torch.tensor([[-np.sin(angle),0.,-np.cos(angle)],
+                #                         [0.,-1.,0.],
+                #                         [-np.cos(angle),0.,np.sin(angle)]]))
+                # Tmat = torch.tensor([0.,0.,1.])*cam_r
+                K = torch.tensor([512.,512.,256.,256.])
                 H=W=512
             
             rtk[:3,:3] = Rmat
             rtk[:3,3] = Tmat
             rtk[3,:] = K
-            background = torch.tensor([0.,0.,0.]).cuda()
-            results = self.main_render(rtk,(H,W),torch.tensor([i+self.data_offset[vid]],device=rtk.device),background=background,canonical=not use_deform)
-            rgb = results['render']
-            rgb[rgb>1.]=1.
-            rgb = rgb.moveaxis(0,-1).cpu().numpy()
+            background = torch.tensor([1.,1.,1.]).cuda()
+            id = torch.tensor([target[i]+self.data_offset[vid]],device=rtk.device)
+            if fixed_frame != -1:
+                id = torch.tensor([fixed_frame],device=rtk.device)
+                use_deform = True
+            if frame_bone:
+                results = self.bone_render(rtk,(H,W),id,
+                                       background=background,canonical=not use_deform,bone_color=bone_color)
+            else:
+                results = self.main_render(rtk,(H,W),id,
+                                        background=background,canonical=not use_deform,bone_color=bone_color)
+            rgb = results['render'].clamp(0,1)
+            # rgb[rgb>1.]=1.
+            rgb = rgb.moveaxis(0,-1).detach().cpu().numpy()
             rgbs.append(rgb)
+            if random_color:
+                mask = results['mask']
+                # import pdb;pdb.set_trace()
+                masks.append(mask[0][...,None][:,:,[0,0,0]].detach().cpu().numpy())
+            # if bone_color:
+            #     bone_vis = results['bone_vis'].clamp(0,1)
+            #     others.append(bone_vis.moveaxis(0,-1).detach().cpu().numpy())
             if save_img:
                 cv2.imwrite('%s/%s_%03d_%05d.png'%(savedir,prefix,epoch,i), rgb[...,::-1]*255)
         if save_video:
             save_vid('%s/%s_%03d'%(savedir,prefix,epoch), rgbs, suffix='.mp4',upsample_frame=0)
+            if random_color:
+                save_vid('%s/%s_%03d'%(savedir,prefix[:-6]+'mask',epoch), masks, suffix='.mp4',upsample_frame=0)
+            if bone_color:
+                save_vid('%s/%s_%03d'%(savedir,prefix[:-5]+'bone_vis',epoch), others, suffix='.mp4',upsample_frame=0)
+        return rgbs
